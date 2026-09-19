@@ -13,7 +13,11 @@ EAS profiles: `development`, `production`, and `production-apk` in `packages/app
 
 `development` uses Android `debug`.
 
-For the fork's repeatable Dev APK delivery policy, see [Development artifact delivery](delivery.md).
+## Fork development policy
+
+Use `plaonn/local` for personal changes and keep `main` aligned with upstream. Build and install the development variant locally on a Mac; it uses the `sh.paseo.debug` package ID and can coexist with the production app.
+
+Do not add a fork-specific GitHub Actions or EAS artifact workflow for iterative development. Keep generated APKs local and untracked, and use the local build commands below.
 
 ## Version codes
 
