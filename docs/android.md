@@ -101,30 +101,73 @@ npx cross-env APP_VARIANT=production expo run:android --variant=release
 rm -rf android
 ```
 
-## Running on an emulator against a worktree daemon
+## Android Emulator development loop
 
-`npm run android` builds and installs the dev client, but two connections have to reach your Mac from inside the emulator — Metro (the JS bundle) and the Paseo daemon — and **the emulator does not share the host's loopback**: `localhost` inside the emulator is the emulator itself. Reach the host at `10.0.2.2` (the standard AVD's host alias) for both:
+Use a local emulator as the primary iteration target. Forward both Metro and the checkout-local daemon with `adb reverse`, so the app uses `localhost` without depending on the Mac's LAN address. Keep the packaged daemon on port `6767` untouched. The example uses `6770` because another app may already own the default dev port `6768`.
 
-```bash
-REACT_NATIVE_PACKAGER_HOSTNAME=10.0.2.2 \
-  EXPO_PUBLIC_LOCAL_DAEMON=10.0.2.2:$PASEO_SERVICE_DAEMON_PORT \
-  npm run android
-```
-
-- **`REACT_NATIVE_PACKAGER_HOSTNAME=10.0.2.2`** — without it, Expo bakes your Mac's LAN IP into the dev client's Metro URL, which the emulator can't route to, and the app dies with `Failed to connect to /<lan-ip>:8081` before any JS loads.
-- **`EXPO_PUBLIC_LOCAL_DAEMON=10.0.2.2:<port>`** — the client's daemon endpoint (`packages/app/src/runtime/host-runtime.ts`); when unset it defaults to `localhost:6767`, the production daemon. Use `$PASEO_SERVICE_DAEMON_PORT` for a worktree daemon running as a Paseo service, or `6768` for a standalone `npm run dev:server`. It is inlined into the JS bundle at Metro bundle time, so set it on the build command and clear the Metro cache (`npx expo start -c`) if a change doesn't take.
-
-**Alternative — `adb reverse` + `localhost`** (if `10.0.2.2` misbehaves):
+If you installed the SDK through Android Studio instead of mise, point the build at that SDK and a JDK 21 installation. For Android Studio's default SDK and Homebrew's JDK 21:
 
 ```bash
-adb reverse tcp:8081 tcp:8081
-adb reverse tcp:$PASEO_SERVICE_DAEMON_PORT tcp:$PASEO_SERVICE_DAEMON_PORT
-REACT_NATIVE_PACKAGER_HOSTNAME=localhost \
-  EXPO_PUBLIC_LOCAL_DAEMON=localhost:$PASEO_SERVICE_DAEMON_PORT \
-  npm run android
+export ANDROID_HOME="$HOME/Library/Android/sdk"
+export JAVA_HOME="/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home"
+export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
 ```
 
-This is the Android counterpart of the iOS local-simulator flow in [development.md](development.md): on iOS the simulator shares the Mac's loopback so `localhost:<port>` works directly; on Android you need `10.0.2.2` or `adb reverse`.
+Use your installed JDK path if it differs. Check `emulator -list-avds`, then start one of the listed names in a separate terminal:
+
+```bash
+emulator @<avd-name> -cores 4 -memory 4096
+```
+
+The launch options allocate four virtual CPU cores and 4 GiB RAM without changing the saved AVD configuration. A one-core AVD can stall Android system services during startup and bundling.
+
+If the list is empty, create an AVD with the prerequisite commands above, or use Android Studio → Device Manager → Create Virtual Device and select an image matching your Mac's architecture.
+
+Once `adb devices -l` shows the emulator as `device`, select its serial and forward both ports:
+
+```bash
+export ANDROID_SERIAL=emulator-5554  # use the serial shown by adb
+adb -s "$ANDROID_SERIAL" reverse tcp:8081 tcp:8081
+adb -s "$ANDROID_SERIAL" reverse tcp:6770 tcp:6770
+adb -s "$ANDROID_SERIAL" reverse --list
+```
+
+Run these from the repository root in separate terminals:
+
+```bash
+# Daemon: checkout-local .dev/paseo-home, listening only on Mac loopback
+PASEO_LISTEN=127.0.0.1:6770 ./scripts/dev-daemon.sh
+```
+
+```bash
+# Metro: start before the native build so Expo reuses this server
+EXPO_PUBLIC_LOCAL_DAEMON=localhost:6770 REACT_NATIVE_PACKAGER_HOSTNAME=localhost \
+  npm run start:expo --workspace=@getpaseo/app -- --dev-client --localhost --port 8081
+```
+
+```bash
+# Build and install sh.paseo.debug locally; inherit the SDK/JDK exports above
+EXPO_PUBLIC_LOCAL_DAEMON=localhost:6770 REACT_NATIVE_PACKAGER_HOSTNAME=localhost \
+  npm run android:development
+```
+
+The root `dev:server` and `dev:app` npm scripts explicitly set port `6768`; use the commands above when choosing another port. `EXPO_PUBLIC_LOCAL_DAEMON` is inlined by Metro, so set it on the Metro process itself. Restart Metro with `--clear` when changing the endpoint.
+
+Keep Metro and the daemon running for JS/TS edits and use Fast Refresh. Rebuild after native module or app config changes. Reapply both reverse mappings after restarting or reconnecting the Android target. To reopen the installed dev client against this Metro:
+
+```bash
+adb -s "$ANDROID_SERIAL" shell am start -a android.intent.action.VIEW \
+  -d 'exp+voice-mobile://expo-development-client/?url=http%3A%2F%2Flocalhost%3A8081' \
+  -p sh.paseo.debug
+```
+
+Confirm that the app renders and connects to the intended host. Use app-scoped `adb logcat --pid=<app-pid>` diagnostics (`adb shell pidof sh.paseo.debug`) for startup failures. A Mac health check or a successful Metro bundle alone does not prove that Android executed JS or connected its daemon WebSocket.
+
+### Other transports
+
+The standard AVD host alias `10.0.2.2` also reaches the Mac. Without reverse forwarding, use `REACT_NATIVE_PACKAGER_HOSTNAME=10.0.2.2` and `EXPO_PUBLIC_LOCAL_DAEMON=10.0.2.2:<daemon-port>` on Metro and the build. For a Paseo-managed service, use its assigned `$PASEO_SERVICE_DAEMON_PORT` instead of `6770`.
+
+For an Android 11+ physical device, enable Developer options → Wireless debugging while the phone and Mac share Wi-Fi. Choose **Pair device with pairing code**, then run `adb pair <phone-ip>:<pairing-port>` and enter the displayed code interactively. Run `adb connect <phone-ip>:<debugging-port>` using the address on the main Wireless debugging screen; this port differs from the pairing port. Select the resulting serial and apply the same two reverse mappings. No USB connection is required.
 
 ## Inverted timeline selection
 
