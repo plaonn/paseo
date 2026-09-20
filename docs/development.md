@@ -5,6 +5,8 @@
 - Node.js (see `.tool-versions` for exact version)
 - npm workspaces (comes with Node)
 
+For mobile-only changes, use the existing backend and follow the [Android development loop](android.md#android-development-loop), including physical-device acceptance for foldable multitasking.
+
 ## Running the dev server
 
 ```bash

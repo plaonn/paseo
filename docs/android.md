@@ -101,9 +101,11 @@ npx cross-env APP_VARIANT=production expo run:android --variant=release
 rm -rf android
 ```
 
-## Android Emulator development loop
+## Android development loop
 
-Use a local emulator as the primary iteration target. Forward both Metro and the checkout-local daemon with `adb reverse`, so the app uses `localhost` without depending on the Mac's LAN address. Keep the packaged daemon on port `6767` untouched. The example uses `6770` because another app may already own the default dev port `6768`.
+For mobile-only changes, connect the local development app to the existing packaged daemon on `6767`. This exercises the app against your existing projects and agents without starting another backend. Do not restart that daemon as part of mobile development. Actions in the development app affect its real data; use isolated state for destructive tests.
+
+Use a physical foldable over wireless ADB for split-screen, pop-up window, folding, keyboard, and live window-resizing acceptance. Use the emulator for basic startup checks and supplementary layouts; emulator success does not establish device-specific multitasking behavior. Both targets use the same Mac-local build, Metro, and `adb reverse` loop. See [wireless ADB](#wireless-adb-on-a-physical-device) for pairing.
 
 If you installed the SDK through Android Studio instead of mise, point the build at that SDK and a JDK 21 installation. For Android Studio's default SDK and Homebrew's JDK 21:
 
@@ -113,7 +115,7 @@ export JAVA_HOME="/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home
 export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
 ```
 
-Use your installed JDK path if it differs. Check `emulator -list-avds`, then start one of the listed names in a separate terminal:
+Use your installed JDK path if it differs. For a physical device, skip AVD startup and pair through wireless ADB below. For emulator checks, run `emulator -list-avds`, then start one of the listed names in a separate terminal:
 
 ```bash
 emulator @<avd-name> -cores 4 -memory 4096
@@ -123,37 +125,32 @@ The launch options allocate four virtual CPU cores and 4 GiB RAM without changin
 
 If the list is empty, create an AVD with the prerequisite commands above, or use Android Studio → Device Manager → Create Virtual Device and select an image matching your Mac's architecture.
 
-Once `adb devices -l` shows the emulator as `device`, select its serial and forward both ports:
+Once `adb devices -l` shows your emulator or paired physical device as `device`, select its serial and forward both ports:
 
 ```bash
 export ANDROID_SERIAL=emulator-5554  # use the serial shown by adb
 adb -s "$ANDROID_SERIAL" reverse tcp:8081 tcp:8081
-adb -s "$ANDROID_SERIAL" reverse tcp:6770 tcp:6770
+adb -s "$ANDROID_SERIAL" reverse tcp:6767 tcp:6767
 adb -s "$ANDROID_SERIAL" reverse --list
 ```
 
-Run these from the repository root in separate terminals:
-
-```bash
-# Daemon: checkout-local .dev/paseo-home, listening only on Mac loopback
-PASEO_LISTEN=127.0.0.1:6770 ./scripts/dev-daemon.sh
-```
+Keep the existing Paseo daemon running. Run these from the repository root in separate terminals:
 
 ```bash
 # Metro: start before the native build so Expo reuses this server
-EXPO_PUBLIC_LOCAL_DAEMON=localhost:6770 REACT_NATIVE_PACKAGER_HOSTNAME=localhost \
+EXPO_PUBLIC_LOCAL_DAEMON=localhost:6767 REACT_NATIVE_PACKAGER_HOSTNAME=localhost \
   npm run start:expo --workspace=@getpaseo/app -- --dev-client --localhost --port 8081
 ```
 
 ```bash
 # Build and install sh.paseo.debug locally; inherit the SDK/JDK exports above
-EXPO_PUBLIC_LOCAL_DAEMON=localhost:6770 REACT_NATIVE_PACKAGER_HOSTNAME=localhost \
+EXPO_PUBLIC_LOCAL_DAEMON=localhost:6767 REACT_NATIVE_PACKAGER_HOSTNAME=localhost \
   npm run android:development
 ```
 
-The root `dev:server` and `dev:app` npm scripts explicitly set port `6768`; use the commands above when choosing another port. `EXPO_PUBLIC_LOCAL_DAEMON` is inlined by Metro, so set it on the Metro process itself. Restart Metro with `--clear` when changing the endpoint.
+The root `dev:server` and `dev:app` npm scripts explicitly target a separate dev daemon on `6768`; use the commands above for mobile-only work against the existing backend. `EXPO_PUBLIC_LOCAL_DAEMON` is inlined by Metro, so set it on the Metro process itself. Restart Metro with `--clear` when changing the endpoint.
 
-Keep Metro and the daemon running for JS/TS edits and use Fast Refresh. Rebuild after native module or app config changes. Reapply both reverse mappings after restarting or reconnecting the Android target. To reopen the installed dev client against this Metro:
+Keep Metro and the daemon running for JS/TS edits and use Fast Refresh. Rebuild after native module or app config changes. When multiple Android targets are connected, pass `--device` to the app workspace build script and select the intended target: `npm run android:development --workspace=@getpaseo/app -- --device`. Reapply both reverse mappings after restarting or reconnecting the Android target. To reopen the installed dev client against this Metro:
 
 ```bash
 adb -s "$ANDROID_SERIAL" shell am start -a android.intent.action.VIEW \
@@ -163,11 +160,26 @@ adb -s "$ANDROID_SERIAL" shell am start -a android.intent.action.VIEW \
 
 Confirm that the app renders and connects to the intended host. Use app-scoped `adb logcat --pid=<app-pid>` diagnostics (`adb shell pidof sh.paseo.debug`) for startup failures. A Mac health check or a successful Metro bundle alone does not prove that Android executed JS or connected its daemon WebSocket.
 
+### Separate backend for integration or isolated tests
+
+Start a checkout-local daemon only when changing backend/protocol behavior, when the feature requires a newer backend, or when a test needs isolated data:
+
+```bash
+PASEO_LISTEN=127.0.0.1:6770 ./scripts/dev-daemon.sh
+adb -s "$ANDROID_SERIAL" reverse tcp:6770 tcp:6770
+```
+
+Use `EXPO_PUBLIC_LOCAL_DAEMON=localhost:6770` on Metro and the native build, restarting Metro with `--clear` when switching. This daemon uses `.dev/paseo-home`. Do not substitute the existing daemon's state directory. Keep port `6768` free if another application owns it.
+
 ### Other transports
 
-The standard AVD host alias `10.0.2.2` also reaches the Mac. Without reverse forwarding, use `REACT_NATIVE_PACKAGER_HOSTNAME=10.0.2.2` and `EXPO_PUBLIC_LOCAL_DAEMON=10.0.2.2:<daemon-port>` on Metro and the build. For a Paseo-managed service, use its assigned `$PASEO_SERVICE_DAEMON_PORT` instead of `6770`.
+The standard AVD host alias `10.0.2.2` also reaches the Mac. Without reverse forwarding, use `REACT_NATIVE_PACKAGER_HOSTNAME=10.0.2.2` and `EXPO_PUBLIC_LOCAL_DAEMON=10.0.2.2:<daemon-port>` on Metro and the build. Use `6767` for the existing backend, `6770` for an isolated backend, or the assigned `$PASEO_SERVICE_DAEMON_PORT` for a Paseo-managed service.
 
-For an Android 11+ physical device, enable Developer options → Wireless debugging while the phone and Mac share Wi-Fi. Choose **Pair device with pairing code**, then run `adb pair <phone-ip>:<pairing-port>` and enter the displayed code interactively. Run `adb connect <phone-ip>:<debugging-port>` using the address on the main Wireless debugging screen; this port differs from the pairing port. Select the resulting serial and apply the same two reverse mappings. No USB connection is required.
+### Wireless ADB on a physical device
+
+For an Android 11+ physical device, enable Developer options → Wireless debugging while the phone and Mac share Wi-Fi. Choose **Pair device with pairing code**, then run `adb pair <phone-ip>:<pairing-port>` and enter the displayed code interactively. Run `adb connect <phone-ip>:<debugging-port>` using the address on the main Wireless debugging screen; this port differs from the pairing port. Select the resulting serial and apply the same two reverse mappings. No USB connection is required. Reconnect and reapply reverse mappings if wireless debugging disconnects.
+
+For foldable UI changes, check the same screen full-screen, in split-screen, and in a pop-up window on the actual device. Resize while the screen is open, show/hide the keyboard, and fold/unfold where supported. Verify that controls remain reachable and drafts, navigation, and the host connection survive the transitions. Record the device and tested modes; do not substitute an emulator-only result.
 
 ## Inverted timeline selection
 
