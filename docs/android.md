@@ -181,6 +181,58 @@ For an Android 11+ physical device, enable Developer options → Wireless debugg
 
 For foldable UI changes, check the same screen full-screen, in split-screen, and in a pop-up window on the actual device. Resize while the screen is open, show/hide the keyboard, and fold/unfold where supported. Verify that controls remain reachable and drafts, navigation, and the host connection survive the transitions. Record the device and tested modes; do not substitute an emulator-only result.
 
+### Tailscale development without Wi-Fi
+
+Keep app transport independent of ADB. With Tailscale connected on the Mac and phone, forward Metro and the existing daemon privately within the tailnet. Inspect `tailscale serve status` first and preserve unrelated mappings:
+
+```bash
+tailscale serve --bg --tcp=18081 tcp://127.0.0.1:8081
+tailscale serve --bg --tcp=16767 tcp://127.0.0.1:6767
+```
+
+Start Metro from the repo root, replacing `<mac-tailscale-ip>` with the Mac's Tailscale IPv4 address:
+
+```bash
+EXPO_OFFLINE=1 \
+EXPO_PUBLIC_LOCAL_DAEMON=<mac-tailscale-ip>:16767 \
+EXPO_PACKAGER_PROXY_URL=http://<mac-tailscale-ip>:18081 \
+REACT_NATIVE_PACKAGER_HOSTNAME=<mac-tailscale-ip> \
+  npm run start:expo --workspace=@getpaseo/app -- --dev-client --localhost --port 8081
+```
+
+Stop the previous checkout-owned Metro before switching and add `--clear` when changing the daemon endpoint. `EXPO_OFFLINE=1` disables Expo account/network integration, not phone access to Metro; it avoids a non-interactive login prompt during local development. The proxy URL makes the manifest advertise the tailnet bundle address instead of loopback.
+
+On the phone, open `http://<mac-tailscale-ip>:18081/_expo/loading?platform=android` in a browser and choose the development build. Launching the app icon alone can reuse the previous `localhost:8081` server and stall when ADB reverse is unavailable. This path needs neither Wi-Fi nor ADB; mobile data and Tailscale suffice once the development APK is installed.
+
+### Remote ADB over Tailscale
+
+For logs and native UI control without Wi-Fi, enable **USB debugging** in Developer options (no cable required). While a paired wireless ADB connection is available, enable TCP mode:
+
+```bash
+adb -s <connected-wireless-serial> tcpip 5555
+adb connect <phone-tailscale-ip>:5555
+adb -s <phone-tailscale-ip>:5555 shell getprop ro.product.model
+```
+
+Then turn Wi-Fi off while keeping mobile data, Tailscale, and USB debugging enabled. Verify ADB commands still work. On the tested SM-F966N, disabling Wi-Fi stopped ADB when USB debugging was off; enabling USB debugging restored TCP access on `5555`. Reboot persistence is unverified: after a reboot, reconnect through wireless debugging and repeat `tcpip` if needed.
+
+TCP mode is not bound exclusively to Tailscale. Keep device authorization enabled and turn TCP mode off when the debugging session ends with `adb -s <phone-tailscale-ip>:5555 usb`; this command does not require attaching a cable. Disconnect the host entry afterward. Do not expose ADB with router port forwarding or Tailscale Funnel.
+
+### Verification and teardown
+
+Check app loading, daemon connectivity, Fast Refresh, and native ADB separately. A Metro bundle response alone does not prove execution. For Fast Refresh, a temporary marker in a mounted component can be observed through the phone's React Native JS debugger, then removed and the file restored. Metro's `/json/list` lists debugger targets; select the exact app and device and inspect only task-relevant state. ADB remains necessary for native logs and UI input, but not for the JS debugger.
+
+This workflow has been exercised on an SM-F966N: tailnet app loading, a code marker reaching the live JS runtime, and ADB commands with Wi-Fi disabled. This does not establish foldable layout acceptance, notification support, reboot persistence, or error-free reloads. Investigate app errors separately from transport success.
+
+At session end, stop only the checkout-owned Metro and any separate dev daemon, disable ADB TCP mode, and remove only the Serve mappings created for this session:
+
+```bash
+tailscale serve --tcp=18081 off
+tailscale serve --tcp=16767 off
+```
+
+Keep the packaged daemon and unrelated services running. The installed development app remains on the phone; start Metro and reopen its development URL for the next session.
+
 ## Inverted timeline selection
 
 Android focus and selection visibility requests must not reposition inverted timelines. The
