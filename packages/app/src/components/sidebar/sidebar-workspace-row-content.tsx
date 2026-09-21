@@ -1,8 +1,9 @@
-import { useWorkspaceRelationsLabel } from "@/subagents/workspace-relations-label";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { useWorkspaceWorkerLabel } from "@/subagents/workspace-relations-label";
 import { memo, useMemo, useCallback, useState, type ReactNode } from "react";
-import { Text, View, type ViewStyle } from "react-native";
+import { Text, View, type ViewStyle, type GestureResponderEvent } from "react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
-import { CircleAlert, Folder, FolderGit2, Monitor } from "lucide-react-native";
+import { CircleAlert, CornerDownRight, Folder, FolderGit2, Monitor } from "lucide-react-native";
 import { ProjectStatusIndicator } from "@/components/sidebar/project-leading-visual";
 import type { SidebarSurfaceBackdrop } from "@/styles/surface-backdrop";
 import {
@@ -37,6 +38,7 @@ const needsInputColorMapping = (theme: Theme) => ({
   fill: getStatusDotColor({ theme, bucket: "needs_input" }) ?? undefined,
 });
 
+const ThemedWorker = withUnistyles(CornerDownRight);
 const ThemedCircleAlert = withUnistyles(CircleAlert);
 const ThemedMonitor = withUnistyles(Monitor);
 const ThemedFolder = withUnistyles(Folder);
@@ -127,7 +129,7 @@ export const SidebarWorkspaceRowContent = memo(function SidebarWorkspaceRowConte
   // The workspace carries label names; their colors live in its host's catalog, so the row is
   // where the two meet — the meta line is handed finished definitions.
   const labels = useWorkspaceLabelDefinitions(workspace.serverId, workspace.labels);
-  const relationshipLabel = useWorkspaceRelationsLabel({
+  const workerLabel = useWorkspaceWorkerLabel({
     serverId: workspace.serverId,
     workspaceId: workspace.workspaceId,
   });
@@ -163,13 +165,26 @@ export const SidebarWorkspaceRowContent = memo(function SidebarWorkspaceRowConte
         )}
         <View style={styles.workspaceContentColumn}>
           <View style={styles.workspaceTitleRow}>
+            {workerLabel ? (
+              <Tooltip enabledOnMobile delayDuration={250}>
+                <TooltipTrigger
+                  accessibilityLabel={workerLabel}
+                  testID={`workspace-worker-${workspace.workspaceId}`}
+                  onPress={stopWorkerPress}
+                >
+                  <ThemedWorker size={13} uniProps={foregroundMutedColorMapping} />
+                </TooltipTrigger>
+                <TooltipContent>
+                  <Text style={styles.workerTooltip}>{workerLabel}</Text>
+                </TooltipContent>
+              </Tooltip>
+            ) : null}
             <Text style={workspaceBranchTextStyle} numberOfLines={1}>
               {workspaceLabel}
             </Text>
             <View style={sidebarWorkspaceRowStyles.rowRight}>{children}</View>
           </View>
           <WorkspaceMetaRow
-            relationshipLabel={relationshipLabel}
             currentBranch={workspace.currentBranch}
             projectName={leadingProjectName}
             hostBadge={hostBadge ?? null}
@@ -462,6 +477,7 @@ export function SidebarWorkspaceTrailingActionOverlay({
 }
 
 const styles = StyleSheet.create((theme) => ({
+  workerTooltip: { color: theme.colors.foreground, fontSize: theme.fontSize.sm },
   workspaceRowContent: {
     position: "relative",
   },
@@ -551,3 +567,7 @@ const styles = StyleSheet.create((theme) => ({
     borderColor: theme.colors.surface0,
   },
 }));
+
+function stopWorkerPress(event: GestureResponderEvent) {
+  event.stopPropagation();
+}

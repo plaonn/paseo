@@ -61,7 +61,6 @@ const dangerMapping = (theme: Theme) => ({ color: theme.colors.statusDanger });
  * read first, and it stays the same height as the rest of the line.
  */
 export function WorkspaceMetaRow({
-  relationshipLabel = null,
   currentBranch,
   projectName,
   hostBadge,
@@ -69,7 +68,6 @@ export function WorkspaceMetaRow({
   serviceSummary,
   labels = EMPTY_LABELS,
 }: {
-  relationshipLabel?: string | null;
   currentBranch: string | null;
   projectName: string | null;
   hostBadge: HostBadgeModel | null;
@@ -89,18 +87,13 @@ export function WorkspaceMetaRow({
     checksDisplay,
   });
 
-  if (items.length === 0 && !relationshipLabel) return null;
+  if (items.length === 0) return null;
 
   return (
     <View style={styles.row}>
-      {relationshipLabel ? (
-        <Text style={styles.identityText} numberOfLines={1} accessibilityLabel={relationshipLabel}>
-          {relationshipLabel}
-        </Text>
-      ) : null}
       {items.map((item, index) => (
         <Fragment key={item.kind}>
-          {index > 0 || relationshipLabel ? <Text style={styles.separator}>·</Text> : null}
+          {index > 0 ? <Text style={styles.separator}>·</Text> : null}
           <MetaItemNode item={item} hostBadge={hostBadge} leading={index === 0} />
         </Fragment>
       ))}

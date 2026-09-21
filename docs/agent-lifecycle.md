@@ -80,11 +80,14 @@ A watched child that closes before its finish event also notifies the caller so 
 
 ### Workspace relationship display
 
-The sidebar reports child activity in its metadata line, independently of the workspace's
-own status indicator. This uses the existing agent directory and provider-child feed;
-workspace names are never rewritten. A quiet parent can still have working children.
-The count includes nested children and children in other workspaces. It describes runtime
-activity, not whether the user's outcome has been accepted.
+The frontend includes native and provider descendants in the workspace's Working
+classification, including descendants in other workspaces. Permissions and errors
+keep their attention priority. Individual thread state remains unchanged. This uses
+existing daemon feeds and does not require a daemon upgrade.
+
+Dedicated worker workspaces show a small arrow before their title; hover or tap it
+for the parent workspace name. Relationships do not occupy the metadata line or
+rewrite stored names. Runtime activity does not establish outcome acceptance.
 
 ### Collecting descendant workspaces
 

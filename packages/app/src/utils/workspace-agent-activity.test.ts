@@ -158,7 +158,7 @@ describe("workspace agent activity index", () => {
     );
   });
 
-  it("does not let archived or child agents change root workspace activity", () => {
+  it("preserves child attention but ignores archived agents", () => {
     const index = buildWorkspaceAgentActivityIndex(
       new Map([
         [
@@ -195,13 +195,13 @@ describe("workspace agent activity index", () => {
     );
 
     expect(index.get("workspace-a")).toEqual({
-      agentId: "root",
-      status: "running",
-      enteredAt: new Date("2026-06-01T10:00:00.000Z"),
+      agentId: "child",
+      status: "needs_input",
+      enteredAt: new Date("2026-06-01T10:03:00.000Z"),
     });
   });
 
-  it("treats a cross-workspace subagent as activity in its own workspace", () => {
+  it("propagates a cross-workspace subagent activity to its parent", () => {
     const index = buildWorkspaceAgentActivityIndex(
       new Map([
         [
@@ -230,9 +230,9 @@ describe("workspace agent activity index", () => {
         [
           "workspace-a",
           {
-            agentId: "parent",
-            status: "done",
-            enteredAt: new Date("2026-06-01T10:00:00.000Z"),
+            agentId: "child",
+            status: "running",
+            enteredAt: new Date("2026-06-01T10:03:00.000Z"),
           },
         ],
         [
@@ -318,5 +318,75 @@ describe("workspace agent activity index", () => {
       status: "needs_input",
       enteredAt: new Date("2026-06-01T10:05:00.000Z"),
     });
+  });
+});
+
+describe("descendant activity", () => {
+  const updatedAt = "2026-06-01T10:00:00.000Z";
+  it("propagates nested activity, then returns to idle without mutating agents", () => {
+    const agents = new Map([
+      ["root", agent({ id: "root", workspaceId: "a", updatedAt })],
+      ["child", agent({ id: "child", workspaceId: "b", parentAgentId: "root", updatedAt })],
+      [
+        "leaf",
+        agent({
+          id: "leaf",
+          workspaceId: "c",
+          parentAgentId: "child",
+          status: "running",
+          updatedAt,
+        }),
+      ],
+      ["other", agent({ id: "other", workspaceId: "d", updatedAt })],
+    ]);
+    const active = buildWorkspaceAgentActivityIndex(agents);
+    expect(["a", "b", "c"].map((id) => active.get(id)?.status)).toEqual([
+      "running",
+      "running",
+      "running",
+    ]);
+    expect(active.get("d")?.status).toBe("done");
+    expect(agents.get("root")?.status).toBe("idle");
+    agents.set("leaf", agent({ id: "leaf", workspaceId: "c", parentAgentId: "child", updatedAt }));
+    expect(buildWorkspaceAgentActivityIndex(agents, active).get("a")?.status).toBe("done");
+  });
+  it("includes provider activity and stops at archived native ancestors", () => {
+    const agents = new Map([
+      ["root", agent({ id: "root", workspaceId: "a", updatedAt })],
+      ["child", agent({ id: "child", workspaceId: "b", parentAgentId: "root", updatedAt })],
+    ]);
+    const provider = {
+      id: "p",
+      parentAgentId: "child",
+      parentSubagentId: null,
+      provider: "codex" as const,
+      title: null,
+      description: null,
+      status: "running" as const,
+      createdAt: updatedAt,
+      updatedAt,
+      toolCallId: null,
+    };
+    expect(buildWorkspaceAgentActivityIndex(agents, undefined, [provider]).get("a")?.status).toBe(
+      "running",
+    );
+    expect(
+      buildWorkspaceAgentActivityIndex(agents, undefined, [
+        { ...provider, status: "completed" },
+      ]).get("a")?.status,
+    ).toBe("done");
+    agents.set(
+      "child",
+      agent({
+        id: "child",
+        workspaceId: "b",
+        parentAgentId: "root",
+        archivedAt: updatedAt,
+        updatedAt,
+      }),
+    );
+    expect(buildWorkspaceAgentActivityIndex(agents, undefined, [provider]).get("a")?.status).toBe(
+      "done",
+    );
   });
 });

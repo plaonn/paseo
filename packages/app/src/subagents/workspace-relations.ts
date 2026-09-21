@@ -27,7 +27,7 @@ export function summarizeWorkspaceRelations(
   agents: ReadonlyMap<string, RelationAgent>,
   providerChildren: readonly ProviderSubagentDescriptorPayload[],
 ): WorkspaceRelations {
-  const local = [...agents.values()].filter((a) => a.workspaceId === workspaceId);
+  const local = [...agents.values()].filter((a) => a.workspaceId === workspaceId && !a.archivedAt);
   const localIds = new Set(local.map((a) => a.id));
   const roots = local.filter((a) => !a.parentAgentId || !localIds.has(a.parentAgentId));
   const reached = new Set(roots.map((a) => a.id));
@@ -36,7 +36,7 @@ export function summarizeWorkspaceRelations(
   while (changed) {
     changed = false;
     for (const a of agents.values()) {
-      if (a.parentAgentId && reached.has(a.parentAgentId) && !reached.has(a.id)) {
+      if (!a.archivedAt && a.parentAgentId && reached.has(a.parentAgentId) && !reached.has(a.id)) {
         reached.add(a.id);
         descendants.set(a.id, a);
         changed = true;
