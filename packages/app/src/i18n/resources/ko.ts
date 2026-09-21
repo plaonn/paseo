@@ -2,6 +2,14 @@ import { en, type TranslationResources } from "./en";
 import { pluginSettings } from "./plugin-settings";
 
 export const ko: TranslationResources = {
+  workspaceRelations: {
+    formerChild: "이전 하위 · {{parent}}",
+    children: "하위 {{running}}/{{total}}",
+    worker: "worker · {{parent}}",
+    missingParent: "부모 연결 확인",
+    attention: "확인 {{count}}",
+    unavailable: "하위 상태 확인 필요",
+  },
   paneFind: {
     searchFailed: "이 채팅을 검색할 수 없습니다. 호스트 연결을 확인하고 다시 시도하세요.",
     searching: "검색 중…",

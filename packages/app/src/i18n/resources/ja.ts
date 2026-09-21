@@ -2,6 +2,14 @@ import { en, type TranslationResources } from "./en";
 import { pluginSettings } from "./plugin-settings";
 
 export const ja: TranslationResources = {
+  workspaceRelations: {
+    formerChild: "以前の子 · {{parent}}",
+    children: "子 {{running}}/{{total}}",
+    worker: "ワーカー · {{parent}}",
+    missingParent: "親を確認できません",
+    attention: "要確認 {{count}}",
+    unavailable: "子の状態を確認できません",
+  },
   paneFind: {
     searchFailed:
       "このチャットを検索できませんでした。ホストへの接続を確認して再試行してください。",

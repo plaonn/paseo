@@ -2,6 +2,14 @@ import { en, type TranslationResources } from "./en";
 import { pluginSettings } from "./plugin-settings";
 
 export const ru: TranslationResources = {
+  workspaceRelations: {
+    formerChild: "Бывший дочерний · {{parent}}",
+    children: "Дочерние {{running}}/{{total}}",
+    worker: "Исполнитель · {{parent}}",
+    missingParent: "Родитель недоступен",
+    attention: "Требуют внимания: {{count}}",
+    unavailable: "Статус дочерних недоступен",
+  },
   paneFind: {
     searchFailed:
       "Не удалось выполнить поиск в чате. Проверьте подключение к хосту и повторите попытку.",

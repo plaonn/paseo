@@ -2,6 +2,14 @@ import { en, type TranslationResources } from "./en";
 import { pluginSettings } from "./plugin-settings";
 
 export const zhCN: TranslationResources = {
+  workspaceRelations: {
+    formerChild: "原子任务 · {{parent}}",
+    children: "子任务 {{running}}/{{total}}",
+    worker: "工作代理 · {{parent}}",
+    missingParent: "父任务不可用",
+    attention: "需关注 {{count}}",
+    unavailable: "子任务状态不可用",
+  },
   paneFind: {
     searchFailed: "无法搜索此聊天。请检查主机连接后重试。",
     searching: "搜索中…",

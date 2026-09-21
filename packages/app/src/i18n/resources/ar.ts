@@ -2,6 +2,14 @@ import { en, type TranslationResources } from "./en";
 import { pluginSettings } from "./plugin-settings";
 
 export const ar: TranslationResources = {
+  workspaceRelations: {
+    formerChild: "تابع سابق · {{parent}}",
+    children: "التوابع {{running}}/{{total}}",
+    worker: "عامل · {{parent}}",
+    missingParent: "الأصل غير متاح",
+    attention: "بحاجة للمراجعة {{count}}",
+    unavailable: "حالة التوابع غير متاحة",
+  },
   paneFind: {
     searchFailed: "تعذر البحث في هذه المحادثة. تحقق من الاتصال بالمضيف وأعد المحاولة.",
     searching: "جارٍ البحث…",

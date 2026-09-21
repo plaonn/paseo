@@ -2,6 +2,14 @@ import { en, type TranslationResources } from "./en";
 import { pluginSettings } from "./plugin-settings";
 
 export const ptBR: TranslationResources = {
+  workspaceRelations: {
+    formerChild: "Antigo subagente · {{parent}}",
+    children: "Filhos {{running}}/{{total}}",
+    worker: "Agente · {{parent}}",
+    missingParent: "Pai indisponível",
+    attention: "Verificar {{count}}",
+    unavailable: "Estado dos filhos indisponível",
+  },
   paneFind: {
     searchFailed:
       "Não foi possível pesquisar nesta conversa. Verifique a conexão com o host e tente novamente.",

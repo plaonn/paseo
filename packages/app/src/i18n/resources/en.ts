@@ -1,4 +1,12 @@
 export const en = {
+  workspaceRelations: {
+    formerChild: "Former child · {{parent}}",
+    children: "Children {{running}}/{{total}}",
+    worker: "Worker · {{parent}}",
+    missingParent: "Parent unavailable",
+    attention: "Attention {{count}}",
+    unavailable: "Child status unavailable",
+  },
   paneFind: {
     searchFailed: "Could not search this chat. Check the host connection and retry.",
     searching: "Searching…",

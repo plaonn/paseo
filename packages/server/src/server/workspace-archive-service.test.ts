@@ -878,3 +878,276 @@ describe("resolveWorkspaceIdAtPath", () => {
     expect(result).toBe("ws-nested");
   });
 });
+
+describe("native descendant workspace collection", () => {
+  async function fixture() {
+    const policy = await import("./workspace-descendant-cleanup.js");
+    const agents: import("./workspace-descendant-cleanup.js").Agent[] = [
+      { id: "parent", workspaceId: "wks_parent", status: "idle", permissions: 0 },
+      { id: "child", workspaceId: "wks_child", parent: "parent", status: "idle", permissions: 0 },
+    ];
+    const captured = policy.captureScope("wks_parent", agents, new Date().toISOString());
+    if (!captured) throw Error("Expected captured scope");
+    captured.confirmed = true;
+    agents[0].archived = true;
+    agents[1].parent = undefined;
+    const journal = { wks_parent: captured };
+    const workspaces: import("./workspace-descendant-cleanup.js").CleanupWorkspace[] = [
+      { id: "wks_child", workspaceDirectory: "/child", pinnedAt: null },
+    ];
+    const archive = vi.fn(async (id: string) => {
+      workspaces.splice(
+        workspaces.findIndex((w) => w.id === id),
+        1,
+      );
+    });
+    const deps = {
+      agents: async () => agents,
+      workspaces: async () => workspaces,
+      save: vi.fn(async () => {}),
+      providerBusy: vi.fn(async () => false),
+      shared: vi.fn(async () => false),
+      preserved: vi.fn(async () => null as string | null),
+    };
+    const actions = { archive, terminals: vi.fn(async () => false) };
+    return {
+      policy,
+      agents,
+      journal,
+      captured,
+      workspaces,
+      archive,
+      deps,
+      actions,
+      run: () => policy.sweepArchives(actions, journal, deps),
+    };
+  }
+  test("captures before agent archival and blocks destructive work if capture persistence fails", async () => {
+    const deps = createArchiveDeps({
+      activeWorkspaces: [{ workspaceId: "wks_parent", cwd: "/parent", kind: "directory" }],
+    });
+    deps.workspaceRegistry = {
+      prepareArchive: async () => {
+        throw Error("journal unavailable");
+      },
+    };
+    await expect(
+      archiveByScope(deps, {
+        scope: { kind: "workspace", workspaceId: "wks_parent" },
+        requestId: "capture",
+      }),
+    ).rejects.toThrow("journal unavailable");
+    expect(deps.activeWorkspaces.map((w) => w.workspaceId)).toEqual(["wks_parent"]);
+  });
+  test("uses captured native ownership after detachment and collects once", async () => {
+    const f = await fixture();
+    expect(f.policy.validJournal(f.journal)).toEqual(f.journal);
+    await f.run();
+    await f.run();
+    expect(f.archive).toHaveBeenCalledTimes(1);
+    expect(f.captured.operations.wks_child.state).toBe("archived");
+  });
+  test.each(["running", "error", "unknown"])("retains %s workers", async (status) => {
+    const f = await fixture();
+    f.agents[1].status = status;
+    await f.run();
+    expect(f.archive).not.toHaveBeenCalled();
+  });
+  test("preserves permissions, provider activity, terminals, pins and unpreserved work", async () => {
+    for (const guard of ["permission", "provider", "terminal", "pin", "git", "shared"]) {
+      const f = await fixture();
+      if (guard === "permission") f.agents[1].permissions = 1;
+      if (guard === "provider") f.deps.providerBusy.mockResolvedValue(true);
+      if (guard === "terminal") f.actions.terminals.mockResolvedValue(true);
+      if (guard === "pin") f.workspaces[0].pinnedAt = new Date().toISOString();
+      if (guard === "git") f.deps.preserved.mockResolvedValue("unpreserved-files");
+      if (guard === "shared") f.deps.shared.mockResolvedValue(true);
+      await f.run();
+      expect(f.archive, guard).not.toHaveBeenCalled();
+    }
+  });
+  test("retains mixed, reassigned and newly interacted-with workspaces", async () => {
+    for (const change of ["mixed", "parent", "message", "workspace"]) {
+      const f = await fixture();
+      if (change === "mixed")
+        f.agents.push({ id: "user", workspaceId: "wks_child", status: "idle", permissions: 0 });
+      if (change === "parent") f.agents[1].parent = "other";
+      if (change === "message") f.agents[1].lastUserMessageAt = new Date().toISOString();
+      if (change === "workspace") f.agents[1].workspaceId = "wks_other";
+      await f.run();
+      expect(f.archive, change).not.toHaveBeenCalled();
+    }
+  });
+  test("never infers authority on missed confirmation or missing captured scope", async () => {
+    const f = await fixture();
+    f.captured.confirmed = false;
+    await f.run();
+    f.captured.confirmed = true;
+    delete f.captured.bindings;
+    await f.run();
+    expect(f.archive).not.toHaveBeenCalled();
+  });
+  test("does not replay an ambiguous archive across sweeps", async () => {
+    const f = await fixture();
+    f.archive.mockImplementation(async () => {
+      throw Error("unknown");
+    });
+    await f.run();
+    await f.run();
+    expect(f.archive).toHaveBeenCalledTimes(1);
+    expect(f.captured.operations.wks_child.state).toBe("unknown");
+  });
+  test("rechecks ownership and provider state after the Git read", async () => {
+    const f = await fixture();
+    f.deps.preserved.mockImplementation(async () => {
+      f.agents[1].lastUserMessageAt = new Date().toISOString();
+      return null;
+    });
+    await f.run();
+    expect(f.archive).not.toHaveBeenCalled();
+    const second = await fixture();
+    second.deps.providerBusy.mockResolvedValueOnce(false).mockResolvedValue(true);
+    await second.run();
+    expect(second.archive).not.toHaveBeenCalled();
+  });
+  test("real Git preservation includes ignored files and remotely retained commits", async () => {
+    const { preservedGit } = await import("./workspace-descendant-cleanup.js");
+    const { repoDir } = createGitRepo();
+    expect(await preservedGit(repoDir)).toBe("commit-not-preserved-on-remote-ref");
+    execFileSync("git", ["update-ref", "refs/remotes/origin/main", "HEAD"], { cwd: repoDir });
+    expect(await preservedGit(repoDir)).toBeNull();
+    writeFileSync(path.join(repoDir, ".git", "info", "exclude"), "private-packet\n");
+    writeFileSync(path.join(repoDir, "private-packet"), "test-only");
+    expect(await preservedGit(repoDir)).toBe("unpreserved-files");
+  });
+});
+
+test("native registry capture survives daemon restart and later unpin collects a retained child", async () => {
+  const { FileBackedWorkspaceRegistry, createPersistedWorkspaceRecord } =
+    await import("./workspace-registry.js");
+  const { startWorkspaceDescendantService } = await import("./workspace-descendant-service.js");
+  const { AgentStorage: Storage, parseStoredAgentRecord } =
+    await import("./agent/agent-storage.js");
+  const { repoDir, tempDir } = createGitRepo();
+  execFileSync("git", ["update-ref", "refs/remotes/origin/main", "HEAD"], { cwd: repoDir });
+  const paseoHome = path.join(tempDir, "native-home");
+  const registry = new FileBackedWorkspaceRegistry(
+    path.join(paseoHome, "workspaces.json"),
+    createLogger(),
+  );
+  const storage = new Storage(path.join(paseoHome, "agents"), createLogger());
+  const now = new Date().toISOString();
+  for (const [id, cwd, pin] of [
+    ["wks_parent", tempDir, false],
+    ["wks_child", repoDir, true],
+  ] as const) {
+    await registry.upsert(
+      createPersistedWorkspaceRecord({
+        workspaceId: id,
+        projectId: "project",
+        cwd,
+        kind: "directory",
+        displayName: id,
+        createdAt: now,
+        updatedAt: now,
+        pinnedAt: pin ? now : null,
+      }),
+    );
+  }
+  for (const [id, workspaceId, parent] of [
+    ["parent", "wks_parent", null],
+    ["child", "wks_child", "parent"],
+  ] as const) {
+    await storage.upsert(
+      parseStoredAgentRecord({
+        id,
+        workspaceId,
+        provider: "mock",
+        cwd: repoDir,
+        createdAt: now,
+        updatedAt: now,
+        lastStatus: "closed",
+        labels: parent ? { "paseo.parent-agent-id": parent } : {},
+      }),
+    );
+  }
+  const options: Parameters<typeof startWorkspaceDescendantService>[0] = {
+    paseoHome,
+    agentStorage: storage,
+    workspaceRegistry: registry,
+    logger: createLogger(),
+    enabled: () => true,
+    agentManager: {
+      listAgents: () => [],
+      getAgent: () => null,
+      listProviderSubagents: () => [],
+      subscribe: () => () => {},
+      updateAgentMetadata: async (id, patch) => {
+        const record = await storage.get(id);
+        if (!record) throw Error("missing agent");
+        await storage.upsert({ ...record, labels: { ...record.labels, ...patch.labels } });
+      },
+    },
+    terminalManager: { getTerminals: async () => [], subscribeTerminalsChanged: () => () => {} },
+    workspaceGitService: { onSnapshotUpdated: () => ({ unsubscribe: () => {} }) },
+    archive: async (id) => registry.archive(id, new Date().toISOString()),
+  };
+  let service = await startWorkspaceDescendantService(options);
+  try {
+    await registry.prepareArchive(["wks_parent"]);
+    const parent = await storage.get("parent"),
+      child = await storage.get("child");
+    if (!parent || !child) throw Error("missing fixture");
+    expect(child.labels["paseo.archived-parent-workspace-name"]).toBe("wks_parent");
+    await storage.upsert({ ...parent, archivedAt: now });
+    const labels = { ...child.labels };
+    delete labels["paseo.parent-agent-id"];
+    await storage.upsert({ ...child, labels });
+    await registry.archive("wks_parent", now);
+    await service.stop();
+    expect((await registry.get("wks_child"))?.archivedAt).toBeNull();
+    service = await startWorkspaceDescendantService(options);
+    await registry.update("wks_child", (record) => ({ ...record, pinnedAt: null }));
+    await vi.waitFor(async () =>
+      expect((await registry.get("wks_child"))?.archivedAt).toBeTruthy(),
+    );
+  } finally {
+    await service.stop();
+  }
+});
+
+test("native archive reservations exclude concurrent collectors and release after failed preparation", async () => {
+  const { FileBackedWorkspaceRegistry } = await import("./workspace-registry.js");
+  const dir = mkdtempSync(path.join(tmpdir(), "archive-reservations-"));
+  cleanupPaths.push(dir);
+  const registry = new FileBackedWorkspaceRegistry(
+    path.join(dir, "workspaces.json"),
+    createLogger(),
+  );
+  const release = await registry.prepareArchive(["wks_parent"]);
+  await expect(registry.prepareArchive(["wks_parent"])).rejects.toThrow("already in progress");
+  expect(registry.isArchiving("wks_parent")).toBe(true);
+  release();
+  const off = registry.subscribeToArchiveRequests(async () => {
+    throw Error("capture failed");
+  });
+  await expect(registry.prepareArchive(["wks_parent"])).rejects.toThrow("capture failed");
+  expect(registry.isArchiving("wks_parent")).toBe(false);
+  off();
+});
+
+test("native collection stays off by default and refuses a second archive owner", async () => {
+  const { descendantArchiveEnabled } = await import("./workspace-descendant-service.js");
+  const config = {
+    version: 1,
+    daemon: { autoArchiveDescendantWorkspaces: true },
+    pluginsEnabled: true,
+    plugins: {
+      "workspace-status": { source: "directory" as const, path: "/plugin", enabled: true },
+    },
+  };
+  expect(descendantArchiveEnabled({ version: 1 })).toBe(false);
+  expect(descendantArchiveEnabled(config)).toBe(false);
+  config.plugins["workspace-status"].enabled = false;
+  expect(descendantArchiveEnabled(config)).toBe(true);
+});

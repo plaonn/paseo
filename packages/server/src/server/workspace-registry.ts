@@ -152,6 +152,7 @@ export interface ProjectRegistry {
 }
 
 export interface WorkspaceRegistry {
+  prepareArchive?(workspaceIds: readonly string[]): Promise<(() => void) | void>;
   initialize(): Promise<void>;
   existsOnDisk(): Promise<boolean>;
   list(): Promise<PersistedWorkspaceRecord[]>;
@@ -530,6 +531,35 @@ export class FileBackedWorkspaceRegistry
       component: "workspaces",
       writeRecords: options?.writeRecords,
     });
+  }
+
+  private readonly archiveRequestListeners = new Set<(ids: readonly string[]) => Promise<void>>();
+
+  subscribeToArchiveRequests(listener: (ids: readonly string[]) => Promise<void>): () => void {
+    this.archiveRequestListeners.add(listener);
+    return () => this.archiveRequestListeners.delete(listener);
+  }
+
+  private readonly archivingWorkspaces = new Set<string>();
+
+  isArchiving(workspaceId: string): boolean {
+    return this.archivingWorkspaces.has(workspaceId);
+  }
+
+  async prepareArchive(workspaceIds: readonly string[]): Promise<() => void> {
+    if (workspaceIds.some((id) => this.archivingWorkspaces.has(id)))
+      throw Error("Workspace archive already in progress");
+    for (const id of workspaceIds) this.archivingWorkspaces.add(id);
+    const release = () => {
+      for (const id of workspaceIds) this.archivingWorkspaces.delete(id);
+    };
+    try {
+      for (const listener of this.archiveRequestListeners) await listener(workspaceIds);
+      return release;
+    } catch (error) {
+      release();
+      throw error;
+    }
   }
 
   subscribeToMutations(

@@ -1,3 +1,5 @@
+import { seedParentWithCrossWorkspaceSubagent } from "../support/helpers/subagents";
+import { openAgentRoute } from "../support/helpers/mock-agent";
 import path from "node:path";
 import { test, expect } from "../support/fixtures";
 import { gotoAppShell } from "../support/helpers/app";
@@ -388,4 +390,31 @@ test.describe("Half-screen desktop layout", () => {
       await workspace.cleanup();
     }
   });
+});
+
+test("native relationships keep workspace names intact and show active children separately", async ({
+  page,
+}, testInfo) => {
+  const workspace = await seedWorkspace({ repoPrefix: "native-relations-", title: "Parent work" });
+  try {
+    const pair = await seedParentWithCrossWorkspaceSubagent(workspace, {
+      parentTitle: "Parent thread",
+      childTitle: "Child thread",
+    });
+    await openAgentRoute(page, { workspaceId: pair.parent.workspaceId, agentId: pair.parent.id });
+    const parent = await waitForSidebarWorkspace(page, pair.parent.workspaceId);
+    const child = await waitForSidebarWorkspace(page, pair.child.workspaceId);
+    await expect(parent).toContainText("Children 1/1");
+    await expect(child).toContainText("Worker · Parent work");
+    const before = await workspace.client.fetchWorkspaces();
+    expect(before.entries.find((w) => w.id === workspace.workspaceId)?.name).toBe("Parent work");
+    await page.screenshot({ path: testInfo.outputPath("native-relations-wide.png") });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await openMobileAgentSidebar(page);
+    await expect(parent).toContainText("Children 1/1");
+    await expect(child).toContainText("Worker · Parent work");
+    await page.screenshot({ path: testInfo.outputPath("native-relations-compact.png") });
+  } finally {
+    await workspace.cleanup();
+  }
 });

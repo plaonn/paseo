@@ -18,6 +18,7 @@ import { isPaseoOwnedWorktreeCwd } from "../../utils/worktree.js";
 import type { WorkspaceArchiveContext } from "../workspace-registry.js";
 
 export interface AutoArchiveArchiveOptions {
+  workspaceRegistry?: import("../workspace-registry.js").WorkspaceRegistry;
   paseoHome: string;
   paseoWorktreesBaseRoot?: string;
   daemonConfigStore: DaemonConfigStore;
@@ -85,6 +86,7 @@ export async function archiveIfSafe(input: {
 
     await deps.archiveByScope(
       {
+        workspaceRegistry: options.workspaceRegistry,
         paseoHome: options.paseoHome,
         paseoWorktreesBaseRoot: options.paseoWorktreesBaseRoot,
         github: options.github,
