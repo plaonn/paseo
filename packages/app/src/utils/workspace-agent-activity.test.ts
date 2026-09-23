@@ -158,7 +158,7 @@ describe("workspace agent activity index", () => {
     );
   });
 
-  it("does not let archived or child agents change root workspace activity", () => {
+  it("preserves child attention but ignores archived agents", () => {
     const index = buildWorkspaceAgentActivityIndex(
       new Map([
         [
@@ -195,13 +195,13 @@ describe("workspace agent activity index", () => {
     );
 
     expect(index.get("workspace-a")).toEqual({
-      agentId: "root",
-      status: "running",
-      enteredAt: new Date("2026-06-01T10:00:00.000Z"),
+      agentId: "child",
+      status: "needs_input",
+      enteredAt: new Date("2026-06-01T10:03:00.000Z"),
     });
   });
 
-  it("treats a cross-workspace subagent as activity in its own workspace", () => {
+  it("propagates a cross-workspace subagent activity to its parent", () => {
     const index = buildWorkspaceAgentActivityIndex(
       new Map([
         [
@@ -230,9 +230,9 @@ describe("workspace agent activity index", () => {
         [
           "workspace-a",
           {
-            agentId: "parent",
-            status: "done",
-            enteredAt: new Date("2026-06-01T10:00:00.000Z"),
+            agentId: "child",
+            status: "running",
+            enteredAt: new Date("2026-06-01T10:03:00.000Z"),
           },
         ],
         [
