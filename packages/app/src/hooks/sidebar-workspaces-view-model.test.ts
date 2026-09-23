@@ -901,7 +901,7 @@ describe("deriveProjectStatusBucket", () => {
     ).toBe("running");
   });
 
-  it("includes a live subagent even when its parent is unavailable", () => {
+  it("ignores archived agents and subagents", () => {
     expect(
       deriveProjectStatusBucket({
         workspaces: [workspacePlacement({ workspaceId: "ws-1" })],
@@ -925,7 +925,7 @@ describe("deriveProjectStatusBucket", () => {
           }),
         },
       }),
-    ).toBe("running");
+    ).toBe("done");
   });
 
   it("ignores agents belonging to workspaces outside the project", () => {

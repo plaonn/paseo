@@ -78,40 +78,6 @@ Permission requests are notification checkpoints, not the end of that subscripti
 The permission notification includes the normalized request plus the child and request IDs, so the caller can inspect it and respond without fetching agent status.
 A watched child that closes before its finish event also notifies the caller so delegated work cannot disappear silently during archive or workspace teardown.
 
-### Workspace relationship display
-
-The frontend includes native and provider descendants in the workspace's Working
-classification, including descendants in other workspaces. Permissions and errors
-keep their attention priority. Individual thread state remains unchanged. This uses
-existing daemon feeds and does not require a daemon upgrade.
-
-Dedicated worker workspaces show a small arrow before their title; hover or tap it
-for the parent workspace name. Relationships do not occupy the metadata line or
-rewrite stored names. Runtime activity does not establish outcome acceptance.
-
-### Collecting descendant workspaces
-
-Set `daemon.autoArchiveDescendantWorkspaces` in the host configuration and restart the daemon
-to enable collection after parent workspace archive. It defaults to off. The archive service
-captures the exact descendant scope before native agent archival can detach cross-workspace
-children. That capture, the parent's confirmed archive, and each collection attempt survive
-restart in `workspace-descendant-archives.json` under `PASEO_HOME`.
-
-Collection retains workers with activity, errors, permissions, terminals, pins, shared
-folders, changed ownership or user interaction, and Git work that has not been preserved.
-Ignored files count as unpreserved work. Later native lifecycle or Git events reconsider
-retained workers; no timer or model prompt is involved. An ambiguous archive is not retried.
-Retained children show their former parent as display-only provenance. This does not recreate
-a live parent relationship or grant cleanup authority. Avoid resuming or reassigning a subtree
-concurrently with archiving it; the native archive API has no atomic idle precondition.
-
-When replacing the legacy workspace-status plugin, stop its runtime before transferring its
-archive journal. Preserve entries without a confirmed capture and unknown operations. Restore
-a managed title only when its exact current value matches that plugin's saved receipt; preserve
-manual renames. Enable native collection only after disabling the old owner. The host refuses
-to run both collectors while the legacy plugin remains enabled. Keep the original state as a
-rollback snapshot until the installed build and title readback are verified.
-
 ## Provider-managed child agents
 
 Some providers can create their own child sessions inside one provider runtime. OMP's task tool reports these with `child_session` events; `AgentManager` imports the live provider handle, stamps `paseo.parent-agent-id`, and surfaces the result as a normal subagent in the parent's subagents track.

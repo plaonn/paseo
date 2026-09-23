@@ -1,9 +1,8 @@
-import {
-  ARCHIVED_PARENT_WORKSPACE_ID_LABEL,
-  ARCHIVED_PARENT_WORKSPACE_NAME_LABEL,
-} from "@getpaseo/protocol/agent-labels";
 import type { Agent } from "@/stores/session-store";
 import type { ProviderSubagentDescriptorPayload } from "@getpaseo/protocol/messages";
+
+const ARCHIVED_PARENT_WORKSPACE_ID_LABEL = "paseo.archived-parent-workspace-id";
+const ARCHIVED_PARENT_WORKSPACE_NAME_LABEL = "paseo.archived-parent-workspace-name";
 
 export type RelationAgent = Pick<
   Agent,

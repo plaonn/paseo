@@ -1,7 +1,3 @@
-import {
-  startWorkspaceDescendantService,
-  descendantArchiveEnabled,
-} from "./workspace-descendant-service.js";
 import { describeHookWorkspace } from "./plugins/lifecycle/index.js";
 import express from "express";
 import { createServer as createHTTPServer, type IncomingMessage, type ServerResponse } from "http";
@@ -1105,7 +1101,6 @@ export async function createPaseoDaemon(
     listActiveWorkspaces: listActiveWorkspacesExternal,
     getAutoArchivedChangeRequestUrl: async (workspaceId) =>
       (await workspaceRegistry.get(workspaceId))?.autoArchivedChangeRequestUrl ?? null,
-    workspaceRegistry,
     archiveWorkspaceRecord: archiveWorkspaceRecordExternal,
     markWorkspaceArchiving: markWorkspaceArchivingExternal,
     clearWorkspaceArchiving: clearWorkspaceArchivingExternal,
@@ -1190,7 +1185,6 @@ export async function createPaseoDaemon(
         findWorkspaceIdForCwd: findWorkspaceIdForCwdExternal,
         listActiveWorkspaces: listActiveWorkspacesExternal,
         getWorkspace: (workspaceIdToGet) => workspaceRegistry.get(workspaceIdToGet),
-        workspaceRegistry,
         archiveWorkspaceRecord: archiveWorkspaceRecordExternal,
         emitWorkspaceUpdatesForWorkspaceIds: emitWorkspaceUpdatesExternal,
         markWorkspaceArchiving: markWorkspaceArchivingExternal,
@@ -1204,18 +1198,6 @@ export async function createPaseoDaemon(
       },
       { scope: { kind: "workspace", workspaceId }, requestId },
     );
-  const descendantConfig = loadPersistedConfig(config.paseoHome);
-  const descendantService = await startWorkspaceDescendantService({
-    paseoHome: config.paseoHome,
-    agentManager,
-    agentStorage,
-    workspaceRegistry,
-    terminalManager,
-    workspaceGitService,
-    logger,
-    enabled: () => descendantArchiveEnabled(descendantConfig),
-    archive: (id) => archiveWorkspaceByIdExternal(id, "archive-descendant-workspace"),
-  });
   const hubAgentLifecycle = new CreateAgentLifecycleDispatch({
     paseoHome: config.paseoHome,
     worktreesRoot: config.worktreesRoot,
@@ -1228,7 +1210,6 @@ export async function createPaseoDaemon(
       archiveAgentCommand({ agentManager, agentStorage, logger }, agentId),
     findWorkspaceIdForCwd: findWorkspaceIdForCwdExternal,
     listActiveWorkspaces: listActiveWorkspacesExternal,
-    workspaceRegistry,
     archiveWorkspaceRecord: archiveWorkspaceRecordExternal,
     emit: emitExternalSessionMessage,
     emitAgentRemove: async () => undefined,
@@ -1325,7 +1306,6 @@ export async function createPaseoDaemon(
         findWorkspaceIdForCwd: findWorkspaceIdForCwdExternal,
         listActiveWorkspaces: listActiveWorkspacesExternal,
         getWorkspace: (workspaceIdToGet) => workspaceRegistry.get(workspaceIdToGet),
-        workspaceRegistry,
         archiveWorkspaceRecord: archiveWorkspaceRecordExternal,
         emitWorkspaceUpdatesForWorkspaceIds: emitWorkspaceUpdatesExternal,
         markWorkspaceArchiving: markWorkspaceArchivingExternal,
@@ -1796,7 +1776,6 @@ export async function createPaseoDaemon(
   };
 
   const stop = async () => {
-    await descendantService.stop();
     await pluginRuntime.stopAllPlugins();
     unsubscribePluginProviders();
     await hubRelationships.stop();

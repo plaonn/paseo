@@ -28,7 +28,6 @@ export type ActiveWorkspaceRef = Pick<
 >;
 
 export interface ArchiveDependencies {
-  workspaceRegistry?: Pick<WorkspaceRegistry, "prepareArchive">;
   paseoHome?: string;
   // Base directory that may hold worktrees across repositories.
   paseoWorktreesBaseRoot?: string;
@@ -135,63 +134,58 @@ async function archiveByScopeWithPriority(
   const target = await resolveArchiveTarget(dependencies, request.scope);
   const targetWorkspaceIds = target.workspaceIds;
 
-  const release = await dependencies.workspaceRegistry?.prepareArchive?.(targetWorkspaceIds);
-  try {
-    await stopWorkspaceSetups(dependencies, target.setupWorkspaceIds, request.requestId);
+  await stopWorkspaceSetups(dependencies, target.setupWorkspaceIds, request.requestId);
 
+  if (targetWorkspaceIds.length > 0) {
+    dependencies.markWorkspaceArchiving(targetWorkspaceIds, new Date().toISOString());
+  }
+
+  let removedDirectory = false;
+
+  try {
     if (targetWorkspaceIds.length > 0) {
-      dependencies.markWorkspaceArchiving(targetWorkspaceIds, new Date().toISOString());
+      await dependencies.emitWorkspaceUpdatesForWorkspaceIds(targetWorkspaceIds);
     }
 
-    let removedDirectory = false;
+    const { archivedAgents, archivedWorkspaceIds } = await archiveTargetRecords(
+      dependencies,
+      targetWorkspaceIds,
+      request.requestId,
+    );
 
-    try {
-      if (targetWorkspaceIds.length > 0) {
-        await dependencies.emitWorkspaceUpdatesForWorkspaceIds(targetWorkspaceIds);
-      }
-
-      const { archivedAgents, archivedWorkspaceIds } = await archiveTargetRecords(
-        dependencies,
-        targetWorkspaceIds,
-        request.requestId,
-      );
-
-      if (target.backing?.mainRepoRoot) {
-        try {
-          await dependencies.workspaceGitService.getSnapshot(target.backing.mainRepoRoot, {
-            force: true,
-            reason: "archive-worktree",
-          });
-        } catch (error) {
-          dependencies.sessionLogger?.warn(
-            { err: error, cwd: target.backing.mainRepoRoot, requestId: request.requestId },
-            "Failed to force-refresh workspace git snapshot after archiving",
-          );
-        }
-      }
-
-      if (target.backing !== null) {
-        removedDirectory = await maybeRemoveDirectory(
-          dependencies,
-          request,
-          target,
-          archivedWorkspaceIds,
+    if (target.backing?.mainRepoRoot) {
+      try {
+        await dependencies.workspaceGitService.getSnapshot(target.backing.mainRepoRoot, {
+          force: true,
+          reason: "archive-worktree",
+        });
+      } catch (error) {
+        dependencies.sessionLogger?.warn(
+          { err: error, cwd: target.backing.mainRepoRoot, requestId: request.requestId },
+          "Failed to force-refresh workspace git snapshot after archiving",
         );
       }
-
-      return {
-        archivedAgentIds: Array.from(archivedAgents),
-        archivedWorkspaceIds,
-        removedDirectory,
-      };
-    } finally {
-      if (targetWorkspaceIds.length > 0) {
-        dependencies.clearWorkspaceArchiving(targetWorkspaceIds);
-        await dependencies.emitWorkspaceUpdatesForWorkspaceIds(targetWorkspaceIds);
-      }
     }
+
+    if (target.backing !== null) {
+      removedDirectory = await maybeRemoveDirectory(
+        dependencies,
+        request,
+        target,
+        archivedWorkspaceIds,
+      );
+    }
+
+    return {
+      archivedAgentIds: Array.from(archivedAgents),
+      archivedWorkspaceIds,
+      removedDirectory,
+    };
   } finally {
-    release?.();
+    if (targetWorkspaceIds.length > 0) {
+      dependencies.clearWorkspaceArchiving(targetWorkspaceIds);
+      await dependencies.emitWorkspaceUpdatesForWorkspaceIds(targetWorkspaceIds);
+    }
   }
 }
 

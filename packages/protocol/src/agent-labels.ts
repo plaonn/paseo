@@ -29,8 +29,3 @@ export function hasOpenAgentTab(labels: Record<string, unknown> | null | undefin
     ([label, value]) => isOpenAgentTabLabel(label) && value === "true",
   );
 }
-
-// Display-only provenance captured before a workspace archive detaches its children.
-// These labels never grant ownership or archive authority.
-export const ARCHIVED_PARENT_WORKSPACE_ID_LABEL = "paseo.archived-parent-workspace-id";
-export const ARCHIVED_PARENT_WORKSPACE_NAME_LABEL = "paseo.archived-parent-workspace-name";

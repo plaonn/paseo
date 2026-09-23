@@ -1,3 +1,5 @@
+import { useProviderSubagentStore } from "@/subagents/provider-store";
+import { buildWorkspaceAgentActivityIndex } from "@/utils/workspace-agent-activity.web";
 import { useCallback, useEffect, useMemo } from "react";
 import { useStoreWithEqualityFn } from "zustand/traditional";
 import { useCreateFlowStore } from "@/stores/create-flow-store";
@@ -18,7 +20,7 @@ import {
   type SidebarProjectEntry,
   type SidebarWorkspaceEntry,
   type SidebarWorkspacePlacement,
-} from "./sidebar-workspaces-view-model";
+} from "./sidebar-workspaces-view-model.web";
 import type { SidebarStateBucket } from "@/utils/sidebar-agent-state";
 
 export {
@@ -58,6 +60,7 @@ export function useSidebarProjectStatusBucket(input: {
   enabled: boolean;
 }): SidebarStateBucket | null {
   const { workspaces, enabled } = input;
+  const providerDescriptors = useProviderSubagentStore((s) => s.descriptors);
   const pendingCreateAttempts = useStoreWithEqualityFn(
     useCreateFlowStore,
     (state) => state.pendingByDraftId,
@@ -69,11 +72,27 @@ export function useSidebarProjectStatusBucket(input: {
       if (!enabled) return null;
       return deriveProjectStatusBucket({
         workspaces,
-        sessions: state.sessions,
+        sessions: Object.fromEntries(
+          Object.entries(state.sessions).map(([id, session]) => [
+            id,
+            session?.agents
+              ? {
+                  ...session,
+                  workspaceAgentActivity: buildWorkspaceAgentActivityIndex(
+                    session.agents,
+                    session.workspaceAgentActivity,
+                    [...providerDescriptors.entries()]
+                      .filter(([key]) => key.startsWith(`${id}\0`))
+                      .map(([, value]) => value),
+                  ),
+                }
+              : session,
+          ]),
+        ),
         pendingCreateAttempts,
       });
     },
-    [enabled, pendingCreateAttempts, workspaces],
+    [enabled, pendingCreateAttempts, workspaces, providerDescriptors],
   );
 
   return useStoreWithEqualityFn(useSessionStore, selector, Object.is);

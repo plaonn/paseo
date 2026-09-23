@@ -18,7 +18,6 @@ import type { AgentManager, AgentSubscriber, SubscribeOptions } from "./agent-ma
 import type { AgentStorage } from "./agent-storage.js";
 
 interface CreateAgentLifecycleDispatchDependencies {
-  workspaceRegistry?: import("../workspace-registry.js").WorkspaceRegistry;
   paseoHome: string;
   worktreesRoot?: string;
   agentManager: AgentManager;
@@ -207,7 +206,6 @@ export class CreateAgentLifecycleDispatch {
         workspaceGitService: this.dependencies.workspaceGitService,
         agentManager: this.dependencies.agentManager,
         agentStorage: this.dependencies.agentStorage,
-        workspaceRegistry: this.dependencies.workspaceRegistry,
         findWorkspaceIdForCwd: this.dependencies.findWorkspaceIdForCwd,
         listActiveWorkspaces: this.dependencies.listActiveWorkspaces,
         archiveWorkspaceRecord: this.dependencies.archiveWorkspaceRecord,

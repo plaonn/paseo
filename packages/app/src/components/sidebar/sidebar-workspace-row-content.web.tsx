@@ -1,7 +1,9 @@
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { useWorkspaceWorkerLabel } from "@/subagents/workspace-relations-label.web";
 import { memo, useMemo, useCallback, useState, type ReactNode } from "react";
-import { Text, View, type ViewStyle } from "react-native";
+import { Text, View, type ViewStyle, type GestureResponderEvent } from "react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
-import { CircleAlert, Folder, FolderGit2, Monitor } from "lucide-react-native";
+import { CircleAlert, CornerDownRight, Folder, FolderGit2, Monitor } from "lucide-react-native";
 import { ProjectStatusIndicator } from "@/components/sidebar/project-leading-visual";
 import type { SidebarSurfaceBackdrop } from "@/styles/surface-backdrop";
 import {
@@ -26,7 +28,7 @@ import {
 } from "@/utils/status-indicator-geometry";
 import { shouldRenderSyncedStatusLoader } from "@/utils/status-loader";
 import { StatusRing } from "@/components/status-ring";
-import { resolveSidebarWorkspacePrimaryLabel } from "@/components/sidebar/sidebar-workspace-title";
+import { resolveSidebarWorkspacePrimaryLabel } from "@/components/sidebar/sidebar-workspace-title.web";
 import { TrailingActionScrim } from "@/components/ui/trailing-action-scrim";
 import { useWorkspaceLabelDefinitions } from "@/workspace-labels";
 
@@ -36,6 +38,7 @@ const needsInputColorMapping = (theme: Theme) => ({
   fill: getStatusDotColor({ theme, bucket: "needs_input" }) ?? undefined,
 });
 
+const ThemedWorker = withUnistyles(CornerDownRight);
 const ThemedCircleAlert = withUnistyles(CircleAlert);
 const ThemedMonitor = withUnistyles(Monitor);
 const ThemedFolder = withUnistyles(Folder);
@@ -126,6 +129,10 @@ export const SidebarWorkspaceRowContent = memo(function SidebarWorkspaceRowConte
   // The workspace carries label names; their colors live in its host's catalog, so the row is
   // where the two meet — the meta line is handed finished definitions.
   const labels = useWorkspaceLabelDefinitions(workspace.serverId, workspace.labels);
+  const workerLabel = useWorkspaceWorkerLabel({
+    serverId: workspace.serverId,
+    workspaceId: workspace.workspaceId,
+  });
   const workspaceBranchTextStyle = useMemo(
     () => [
       styles.workspaceBranchText,
@@ -158,6 +165,20 @@ export const SidebarWorkspaceRowContent = memo(function SidebarWorkspaceRowConte
         )}
         <View style={styles.workspaceContentColumn}>
           <View style={styles.workspaceTitleRow}>
+            {workerLabel ? (
+              <Tooltip enabledOnMobile delayDuration={250}>
+                <TooltipTrigger
+                  accessibilityLabel={workerLabel}
+                  testID={`workspace-worker-${workspace.workspaceId}`}
+                  onPress={stopWorkerPress}
+                >
+                  <ThemedWorker size={13} uniProps={foregroundMutedColorMapping} />
+                </TooltipTrigger>
+                <TooltipContent>
+                  <Text style={styles.workerTooltip}>{workerLabel}</Text>
+                </TooltipContent>
+              </Tooltip>
+            ) : null}
             <Text style={workspaceBranchTextStyle} numberOfLines={1}>
               {workspaceLabel}
             </Text>
@@ -456,6 +477,7 @@ export function SidebarWorkspaceTrailingActionOverlay({
 }
 
 const styles = StyleSheet.create((theme) => ({
+  workerTooltip: { color: theme.colors.foreground, fontSize: theme.fontSize.sm },
   workspaceRowContent: {
     position: "relative",
   },
@@ -545,3 +567,7 @@ const styles = StyleSheet.create((theme) => ({
     borderColor: theme.colors.surface0,
   },
 }));
+
+function stopWorkerPress(event: GestureResponderEvent) {
+  event.stopPropagation();
+}

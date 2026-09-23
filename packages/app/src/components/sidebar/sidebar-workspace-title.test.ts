@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  workspaceDisplayName,
   resolveSidebarWorkspaceAccessibilityLabel,
   resolveSidebarWorkspacePrimaryLabel,
 } from "@/components/sidebar/sidebar-workspace-title";
@@ -73,18 +72,5 @@ describe("resolveSidebarWorkspaceAccessibilityLabel", () => {
     });
 
     expect(label).toBe("Search project, Investigate search, Build host");
-  });
-});
-
-describe("legacy relationship display compatibility", () => {
-  it.each([
-    ["[하위 1/5] Parent", "Parent"],
-    ["[하위 0/2 · 확인 2] Parent", "Parent"],
-    ["[worker @ Parent] Task", "Task"],
-    ["[worker @ Parent · 하위 1/2] Task", "Task"],
-    ["[todo] Task", "[todo] Task"],
-    ["[worker @ Parent]", "[worker @ Parent]"],
-  ])("renders %s as %s without a stored rename", (input, expected) => {
-    expect(workspaceDisplayName(input)).toBe(expected);
   });
 });

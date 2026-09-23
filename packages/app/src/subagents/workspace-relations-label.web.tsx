@@ -1,8 +1,8 @@
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { useSessionStore, type Agent } from "@/stores/session-store";
-import { summarizeWorkspaceRelations } from "./workspace-relations";
-import { workspaceDisplayName } from "@/components/sidebar/sidebar-workspace-title";
+import { summarizeWorkspaceRelations } from "./workspace-relations.web";
+import { workspaceDisplayName } from "@/components/sidebar/sidebar-workspace-title.web";
 
 const EMPTY_AGENTS = new Map<string, Agent>();
 
