@@ -122,6 +122,16 @@ describe("paseo worktree manager", () => {
       });
       writeFileSync(join(foreignPaths[1]!, "private.txt"), "foreign untracked data\n");
       writeFileSync(join(foreignPaths[2]!, "file.txt"), "foreign modified data\n");
+      // Git expands Windows short directory names in its inventory. Capture its
+      // spelling while the directories still exist, before testing missing paths.
+      const targetGitPath = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+        cwd: created.worktreePath,
+        encoding: "utf8",
+      }).trim();
+      const staleGitPath = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+        cwd: foreignPaths[0]!,
+        encoding: "utf8",
+      }).trim();
       rmSync(foreignPaths[0]!, { recursive: true });
       // Make the foreign stale registration eligible even with Git's default expiry.
       const staleAdmin = join(repoDir, ".git", "worktrees", "foreign-stale");
@@ -150,16 +160,11 @@ describe("paseo worktree manager", () => {
             encoding: "utf8",
           })
             .split("\n\n")
-            .filter(
-              (entry) =>
-                !entry.startsWith(`worktree ${created.worktreePath.replaceAll("\\", "/")}\n`),
-            ),
+            .filter((entry) => !entry.startsWith(`worktree ${targetGitPath}\n`)),
         };
       }
       const before = snapshotForeignState();
-      expect(before.inventory.join("\n")).toContain(
-        `worktree ${foreignPaths[0]!.replaceAll("\\", "/")}\n`,
-      );
+      expect(before.inventory.join("\n")).toContain(`worktree ${staleGitPath}\n`);
       expect(before.inventory.join("\n")).toContain("prunable");
       expect(before.inventory.join("\n")).toContain("locked foreign owner");
       await expect(
