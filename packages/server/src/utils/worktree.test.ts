@@ -150,11 +150,16 @@ describe("paseo worktree manager", () => {
             encoding: "utf8",
           })
             .split("\n\n")
-            .filter((entry) => !entry.startsWith(`worktree ${created.worktreePath}\n`)),
+            .filter(
+              (entry) =>
+                !entry.startsWith(`worktree ${created.worktreePath.replaceAll("\\", "/")}\n`),
+            ),
         };
       }
       const before = snapshotForeignState();
-      expect(before.inventory.join("\n")).toContain(`worktree ${foreignPaths[0]}\n`);
+      expect(before.inventory.join("\n")).toContain(
+        `worktree ${foreignPaths[0]!.replaceAll("\\", "/")}\n`,
+      );
       expect(before.inventory.join("\n")).toContain("prunable");
       expect(before.inventory.join("\n")).toContain("locked foreign owner");
       await expect(
