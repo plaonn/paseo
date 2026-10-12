@@ -1140,14 +1140,8 @@ export async function deletePaseoWorktree({
   }
 
   await removeDirectoryWithRetries(resolvedWorktree);
-
-  if (cwd) {
-    try {
-      await runGitCommand(["worktree", "prune"], { cwd, timeout: 30_000 });
-    } catch {
-      // not critical; git will prune lazily
-    }
-  }
+  // Repository-wide pruning can remove other owners' stale registrations.
+  // Git removal above owns only this target's administrative entry.
 }
 
 export async function rollbackCreatedPaseoWorktree(

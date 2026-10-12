@@ -3,6 +3,7 @@ import {
   createWorktree as createWorktreePrimitive,
   deriveWorktreeProjectHash,
   deletePaseoWorktree,
+  rollbackCreatedPaseoWorktree,
   isPaseoOwnedWorktreeCwd,
   mapWorkspaceCwdToWorktree,
   slugify,
@@ -18,8 +19,11 @@ import {
   realpathSync,
   symlinkSync,
   writeFileSync,
+  readFileSync,
+  readdirSync,
+  utimesSync,
 } from "fs";
-import { join } from "path";
+import { basename, join } from "path";
 import { tmpdir } from "os";
 import { createRealpathAwarePathMatcher } from "./path";
 
@@ -52,6 +56,23 @@ function createLegacyWorktreeForTest(
   });
 }
 
+function snapshotFiles(root: string): Record<string, string> {
+  const files: Record<string, string> = {};
+  function visit(directory: string, prefix: string): void {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const relativePath = prefix + entry.name;
+      if (entry.isDirectory()) {
+        files[relativePath + "/"] = "directory";
+        visit(join(directory, entry.name), relativePath + "/");
+      } else {
+        files[relativePath] = readFileSync(join(directory, entry.name)).toString("base64");
+      }
+    }
+  }
+  visit(root, "");
+  return files;
+}
+
 describe("paseo worktree manager", () => {
   let tempDir: string;
   let repoDir: string;
@@ -76,6 +97,95 @@ describe("paseo worktree manager", () => {
   afterEach(() => {
     rmSync(tempDir, { recursive: true, force: true });
   });
+
+  it.each(["delete", "rollback", "missing-path", "missing-admin"] as const)(
+    "%s cleans only the owned target and preserves foreign worktrees on retry",
+    async (operation) => {
+      const created = await createLegacyWorktreeForTest({
+        branchName: "owned-target",
+        cwd: repoDir,
+        baseBranch: "main",
+        worktreeSlug: "owned-target",
+        paseoHome,
+      });
+      const foreignPaths = ["foreign-stale", "foreign-active", "foreign-locked"].map((name) =>
+        join(tempDir, name),
+      );
+      for (const foreignPath of foreignPaths) {
+        execFileSync("git", ["worktree", "add", "-b", basename(foreignPath), foreignPath], {
+          cwd: repoDir,
+          stdio: "pipe",
+        });
+      }
+      execFileSync("git", ["worktree", "lock", "--reason", "foreign owner", foreignPaths[2]!], {
+        cwd: repoDir,
+      });
+      writeFileSync(join(foreignPaths[1]!, "private.txt"), "foreign untracked data\n");
+      writeFileSync(join(foreignPaths[2]!, "file.txt"), "foreign modified data\n");
+      // Git expands Windows short directory names in its inventory. Capture its
+      // spelling while the directories still exist, before testing missing paths.
+      const targetGitPath = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+        cwd: created.worktreePath,
+        encoding: "utf8",
+      }).trim();
+      const staleGitPath = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+        cwd: foreignPaths[0]!,
+        encoding: "utf8",
+      }).trim();
+      rmSync(foreignPaths[0]!, { recursive: true });
+      // Make the foreign stale registration eligible even with Git's default expiry.
+      const staleAdmin = join(repoDir, ".git", "worktrees", "foreign-stale");
+      for (const entry of readdirSync(staleAdmin)) {
+        utimesSync(join(staleAdmin, entry), new Date(0), new Date(0));
+      }
+      utimesSync(staleAdmin, new Date(0), new Date(0));
+
+      const targetAdmin = join(repoDir, ".git", "worktrees", "owned-target");
+      if (operation === "missing-path") {
+        rmSync(created.worktreePath, { recursive: true });
+      } else if (operation === "missing-admin") {
+        rmSync(targetAdmin, { recursive: true });
+      }
+      function snapshotForeignState() {
+        return {
+          admins: ["foreign-stale", "foreign-active", "foreign-locked"].map((name) =>
+            snapshotFiles(join(repoDir, ".git", "worktrees", name)),
+          ),
+          files: foreignPaths.slice(1).map(snapshotFiles),
+          source: readFileSync(join(repoDir, "file.txt"), "utf8"),
+          refs: execFileSync("git", ["show-ref"], { cwd: repoDir, encoding: "utf8" }),
+          refFiles: snapshotFiles(join(repoDir, ".git", "refs")),
+          inventory: execFileSync("git", ["worktree", "list", "--porcelain"], {
+            cwd: repoDir,
+            encoding: "utf8",
+          })
+            .split("\n\n")
+            .filter((entry) => !entry.startsWith(`worktree ${targetGitPath}\n`)),
+        };
+      }
+      const before = snapshotForeignState();
+      expect(before.inventory.join("\n")).toContain(`worktree ${staleGitPath}\n`);
+      expect(before.inventory.join("\n")).toContain("prunable");
+      expect(before.inventory.join("\n")).toContain("locked foreign owner");
+      await expect(
+        deletePaseoWorktree({ cwd: repoDir, worktreePath: foreignPaths[1]!, paseoHome }),
+      ).rejects.toThrow("Refusing to delete non-Paseo worktree");
+      expect(snapshotForeignState()).toEqual(before);
+      const options = { cwd: repoDir, worktreePath: created.worktreePath, paseoHome };
+      if (operation === "rollback") {
+        const cause = new Error("workspace provisioning failed");
+        await expect(rollbackCreatedPaseoWorktree(options, cause)).rejects.toBe(cause);
+      } else {
+        await deletePaseoWorktree(options);
+      }
+      expect(existsSync(created.worktreePath)).toBe(false);
+      expect(existsSync(targetAdmin)).toBe(false);
+      expect(snapshotForeignState()).toEqual(before);
+      await expect(deletePaseoWorktree(options)).resolves.toBeUndefined();
+      expect(snapshotForeignState()).toEqual(before);
+      expect(existsSync(foreignPaths[0]!)).toBe(false);
+    },
+  );
 
   it("treats a worktree as paseo-owned even when its .git admin is missing", async () => {
     const created = await createLegacyWorktreeForTest({
