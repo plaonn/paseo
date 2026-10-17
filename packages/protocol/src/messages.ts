@@ -737,6 +737,9 @@ export const AgentStreamEventPayloadSchema = z.discriminatedUnion("type", [
     turnId: z.string().optional(),
     error: z.string(),
     code: z.string().optional(),
+    // COMPAT(agentTurnRecovery): added in v0.9.0-beta.2, remove optional fields after 2027-10-17.
+    providerCode: z.union([z.string(), z.number()]).optional(),
+    providerClass: z.string().optional(),
     diagnostic: z.string().optional(),
   }),
   z.object({
@@ -1838,6 +1841,23 @@ export const FetchAgentTimelineRequestMessageSchema = z.object({
   projection: z.enum(["projected", "canonical"]).optional(),
   // Allow the client to merge this bounded page outside its contiguous loaded range.
   mergeWindow: z.boolean().optional(),
+});
+
+export const AgentTurnObserveRequestMessageSchema = z.object({
+  type: z.literal("agent.turn.observe.request"),
+  requestId: z.string(),
+  agentId: z.string(),
+  turnId: z.string().optional(),
+});
+
+export const AgentTurnContinueAfterFailureRequestMessageSchema = z.object({
+  type: z.literal("agent.turn.continue_after_failure.request"),
+  requestId: z.string(),
+  agentId: z.string(),
+  expectedTurnId: z.string().min(1),
+  expectedConfigDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  idempotencyKey: z.string().min(1).max(200),
+  prompt: z.string(),
 });
 
 export const AgentTimelineSearchRequestMessageSchema = z.object({
@@ -3240,6 +3260,8 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   RestartServerRequestMessageSchema,
   DaemonUpdateRequestMessageSchema,
   FetchAgentTimelineRequestMessageSchema,
+  AgentTurnObserveRequestMessageSchema,
+  AgentTurnContinueAfterFailureRequestMessageSchema,
   AgentTimelineSearchRequestMessageSchema,
   AgentTimelineListPromptsRequestMessageSchema,
   ProviderSubagentListRequestMessageSchema,
@@ -3529,6 +3551,8 @@ export const ServerInfoStatusPayloadSchema = z
         agentRequestReceipts: z.boolean().optional(),
         // COMPAT(workspaceRequestReceipts): added in v0.8.0; remove gate after 2027-03-07.
         workspaceRequestReceipts: z.boolean().optional(),
+        // COMPAT(agentTurnRecovery): added in v0.9.0-beta.2, remove optional parsing after 2027-10-17.
+        agentTurnRecovery: z.boolean().optional(),
         creationLifecycle: z.boolean().optional(),
         // COMPAT(hubAgentRpc): added in v0.8.0; remove gate after 2027-03-05.
         hubAgentRpc: z.boolean().optional(),
@@ -4589,6 +4613,133 @@ export const FetchAgentTimelineResponseMessageSchema = z.object({
     mergeWindow: z.boolean().optional(),
     entries: z.array(AgentTimelineEntryPayloadSchema),
     error: z.string().nullable(),
+  }),
+});
+
+const AgentTurnEffectManifestPayloadSchema = z.object({
+  toolCalls: z.array(
+    z.object({
+      callId: z.string(),
+      name: z.string(),
+      status: z.enum(["running", "completed", "failed", "canceled"]),
+    }),
+  ),
+  fileWrites: z.array(
+    z.object({
+      callId: z.string(),
+      path: z.string().nullable(),
+      status: z.enum(["running", "completed", "failed", "canceled"]),
+    }),
+  ),
+  shellCommands: z.array(
+    z.object({
+      callId: z.string(),
+      command: z.string().nullable(),
+      status: z.enum(["running", "completed", "failed", "canceled"]),
+    }),
+  ),
+  messageDeliveries: z.array(
+    z.object({
+      callId: z.string(),
+      name: z.string(),
+      status: z.enum(["running", "completed", "failed", "canceled"]),
+    }),
+  ),
+  subAgentSpawns: z.array(
+    z.object({
+      id: z.string(),
+      status: z.enum(["running", "completed", "failed", "canceled"]),
+    }),
+  ),
+  assistantResponses: z.number().int().nonnegative(),
+});
+
+export const AgentTurnEffectsPayloadSchema = z.discriminatedUnion("state", [
+  z.object({ state: z.literal("none_proven") }),
+  z.object({ state: z.literal("present") }).extend(AgentTurnEffectManifestPayloadSchema.shape),
+  z
+    .object({ state: z.literal("unknown"), reason: z.string() })
+    .extend({ observed: AgentTurnEffectManifestPayloadSchema }),
+]);
+
+export const AgentTurnObservationPayloadSchema = z.object({
+  turnId: z.string().nullable(),
+  status: z.enum(["running", "completed", "failed", "cancelled", "unknown"]),
+  provider: z.string().nullable(),
+  workspaceId: z.string().nullable(),
+  model: z.string().nullable(),
+  thinkingEffort: z.string().nullable(),
+  mode: z.string().nullable(),
+  configDigest: z.string().nullable(),
+  configComplete: z.boolean(),
+  startedAt: z.string().nullable(),
+  finishedAt: z.string().nullable(),
+  error: z
+    .object({
+      providerCode: z.union([z.string(), z.number()]).nullable(),
+      providerClass: z.string().nullable(),
+      rawMessage: z.string(),
+      normalizedClass: z.enum(["capacity_overload", "unknown"]),
+    })
+    .nullable(),
+  effects: AgentTurnEffectsPayloadSchema,
+  complete: z.boolean(),
+  truncated: z.boolean(),
+});
+
+export const AgentTurnContinuationReceiptPayloadSchema = z.object({
+  key: z.string(),
+  agentId: z.string(),
+  turnId: z.string(),
+  newTurnId: z.string().nullable(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  configDigest: z.string(),
+  state: z.enum(["pending", "outcome_unknown", "started"]),
+});
+
+export const AgentTurnContinuationRefusalReasonSchema = z.enum([
+  "invalid_idempotency_key",
+  "idempotency_key_conflict",
+  "observation_unavailable",
+  "agent_not_found",
+  "agent_archived",
+  "agent_closed",
+  "agent_not_loaded",
+  "agent_state_unreadable",
+  "continuation_in_progress",
+  "queued_prompt",
+  "config_mutation_in_progress",
+  "active_turn",
+  "turn_not_found",
+  "turn_mismatch",
+  "turn_not_failed",
+  "telemetry_incomplete",
+  "telemetry_unreadable",
+  "effects_not_none_proven",
+  "config_incomplete",
+  "config_changed",
+  "continuation_unavailable",
+]);
+
+export const AgentTurnObserveResponseMessageSchema = z.object({
+  type: z.literal("agent.turn.observe.response"),
+  payload: z.object({
+    requestId: z.string(),
+    agentId: z.string(),
+    observation: AgentTurnObservationPayloadSchema,
+    error: z.string().nullable(),
+  }),
+});
+
+export const AgentTurnContinueAfterFailureResponseMessageSchema = z.object({
+  type: z.literal("agent.turn.continue_after_failure.response"),
+  payload: z.object({
+    requestId: z.string(),
+    agentId: z.string(),
+    status: z.enum(["started", "outcome_unknown", "refused"]),
+    refusalReason: AgentTurnContinuationRefusalReasonSchema.nullable(),
+    receipt: AgentTurnContinuationReceiptPayloadSchema.nullable(),
   }),
 });
 
@@ -6796,6 +6947,8 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   ArchiveWorkspaceResponseMessageSchema,
   FetchAgentResponseMessageSchema,
   FetchAgentTimelineResponseMessageSchema,
+  AgentTurnObserveResponseMessageSchema,
+  AgentTurnContinueAfterFailureResponseMessageSchema,
   AgentTimelineReplacementMessageSchema,
   AgentTimelineSearchResponseMessageSchema,
   AgentTimelineListPromptsResponseMessageSchema,
@@ -7019,6 +7172,21 @@ export type ArchiveWorkspaceResponseMessage = z.infer<typeof ArchiveWorkspaceRes
 export type FetchAgentResponseMessage = z.infer<typeof FetchAgentResponseMessageSchema>;
 export type FetchAgentTimelineResponseMessage = z.infer<
   typeof FetchAgentTimelineResponseMessageSchema
+>;
+export type AgentTurnObserveRequestMessage = z.infer<typeof AgentTurnObserveRequestMessageSchema>;
+export type AgentTurnContinueAfterFailureRequestMessage = z.infer<
+  typeof AgentTurnContinueAfterFailureRequestMessageSchema
+>;
+export type AgentTurnObservationPayload = z.infer<typeof AgentTurnObservationPayloadSchema>;
+export type AgentTurnContinuationReceiptPayload = z.infer<
+  typeof AgentTurnContinuationReceiptPayloadSchema
+>;
+export type AgentTurnContinuationRefusalReason = z.infer<
+  typeof AgentTurnContinuationRefusalReasonSchema
+>;
+export type AgentTurnObserveResponseMessage = z.infer<typeof AgentTurnObserveResponseMessageSchema>;
+export type AgentTurnContinueAfterFailureResponseMessage = z.infer<
+  typeof AgentTurnContinueAfterFailureResponseMessageSchema
 >;
 export type AgentTimelineListPromptsResponseMessage = z.infer<
   typeof AgentTimelineListPromptsResponseMessageSchema

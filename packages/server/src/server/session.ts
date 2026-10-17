@@ -5,7 +5,11 @@ import type { SessionEventSubscription } from "@getpaseo/protocol/messages";
 import { relative } from "node:path";
 import { isAbsolute } from "node:path";
 import { CreationService } from "./creation/index.js";
-import type { CreationSnapshot, AgentCreateRequest } from "@getpaseo/protocol/messages";
+import type {
+  CreationSnapshot,
+  AgentCreateRequest,
+  AgentTurnObservationPayload,
+} from "@getpaseo/protocol/messages";
 import type { MessageReceipts } from "./message-receipts/index.js";
 import equal from "fast-deep-equal";
 import { SessionDelivery, type OwnedSubscription } from "./session/owned-subscriptions/index.js";
@@ -2609,6 +2613,10 @@ export class Session {
     source?: object,
   ): Promise<void> | undefined {
     switch (msg.type) {
+      case "agent.turn.observe.request":
+        return this.handleAgentTurnObserveRequest(msg);
+      case "agent.turn.continue_after_failure.request":
+        return this.handleAgentTurnContinueAfterFailureRequest(msg);
       case "fetch_agent_timeline_request":
         return this.handleFetchAgentTimelineRequest(msg, source);
       case "agent.timeline.append.request":
@@ -7587,6 +7595,176 @@ export class Session {
     });
   }
 
+  private unknownAgentTurnObservation(
+    turnId: string | null,
+    reason: string,
+    truncated = false,
+  ): AgentTurnObservationPayload {
+    return {
+      turnId,
+      status: "unknown",
+      provider: null,
+      workspaceId: null,
+      model: null,
+      thinkingEffort: null,
+      mode: null,
+      configDigest: null,
+      configComplete: false,
+      startedAt: null,
+      finishedAt: null,
+      error: null,
+      effects: {
+        state: "unknown",
+        reason,
+        observed: {
+          toolCalls: [],
+          fileWrites: [],
+          shellCommands: [],
+          messageDeliveries: [],
+          subAgentSpawns: [],
+          assistantResponses: 0,
+        },
+      },
+      complete: false,
+      truncated,
+    };
+  }
+
+  private async handleAgentTurnObserveRequest(
+    msg: Extract<SessionInboundMessage, { type: "agent.turn.observe.request" }>,
+  ): Promise<void> {
+    const resolved = await this.resolveAgentIdentifier(msg.agentId);
+    if (!resolved.ok) {
+      this.emit({
+        type: "agent.turn.observe.response",
+        payload: {
+          requestId: msg.requestId,
+          agentId: msg.agentId,
+          observation: this.unknownAgentTurnObservation(msg.turnId ?? null, "agent_not_found"),
+          error: resolved.error,
+        },
+      });
+      return;
+    }
+
+    try {
+      const stored = await this.agentManager.observeTurn(resolved.agentId, msg.turnId);
+      const observation: AgentTurnObservationPayload = stored
+        ? {
+            turnId: stored.turnId,
+            status: stored.status,
+            provider: stored.provider,
+            workspaceId: stored.workspaceId,
+            model: stored.model,
+            thinkingEffort: stored.thinkingEffort,
+            mode: stored.mode,
+            configDigest: stored.configDigest,
+            configComplete: stored.configComplete,
+            startedAt: stored.startedAt,
+            finishedAt: stored.finishedAt,
+            error: stored.error,
+            effects: stored.effects,
+            complete: stored.complete,
+            truncated: stored.truncated,
+          }
+        : this.unknownAgentTurnObservation(msg.turnId ?? null, "turn_not_observed");
+      this.emit({
+        type: "agent.turn.observe.response",
+        payload: {
+          requestId: msg.requestId,
+          agentId: resolved.agentId,
+          observation,
+          error: null,
+        },
+      });
+    } catch (error) {
+      this.sessionLogger.error(
+        { err: error, agentId: resolved.agentId, turnId: msg.turnId },
+        "Failed to read agent turn observation",
+      );
+      this.emit({
+        type: "agent.turn.observe.response",
+        payload: {
+          requestId: msg.requestId,
+          agentId: resolved.agentId,
+          observation: this.unknownAgentTurnObservation(
+            msg.turnId ?? null,
+            "timeline_unreadable",
+            true,
+          ),
+          error: null,
+        },
+      });
+    }
+  }
+
+  private async handleAgentTurnContinueAfterFailureRequest(
+    msg: Extract<SessionInboundMessage, { type: "agent.turn.continue_after_failure.request" }>,
+  ): Promise<void> {
+    const resolved = await this.resolveAgentIdentifier(msg.agentId);
+    if (!resolved.ok) {
+      this.emit({
+        type: "agent.turn.continue_after_failure.response",
+        payload: {
+          requestId: msg.requestId,
+          agentId: msg.agentId,
+          status: "refused",
+          refusalReason: "agent_not_found",
+          receipt: null,
+        },
+      });
+      return;
+    }
+
+    try {
+      const result = await this.agentManager.continueAfterFailure({
+        agentId: resolved.agentId,
+        expectedTurnId: msg.expectedTurnId,
+        expectedConfigDigest: msg.expectedConfigDigest,
+        idempotencyKey: msg.idempotencyKey,
+        prompt: msg.prompt,
+      });
+      if (result.status === "refused") {
+        this.emit({
+          type: "agent.turn.continue_after_failure.response",
+          payload: {
+            requestId: msg.requestId,
+            agentId: resolved.agentId,
+            status: "refused",
+            refusalReason: result.reason,
+            receipt: null,
+          },
+        });
+        return;
+      }
+      this.emit({
+        type: "agent.turn.continue_after_failure.response",
+        payload: {
+          requestId: msg.requestId,
+          agentId: resolved.agentId,
+          status: result.receipt.state === "started" ? "started" : "outcome_unknown",
+          refusalReason: null,
+          receipt: result.receipt,
+        },
+      });
+    } catch (error) {
+      this.sessionLogger.error(
+        { err: error, agentId: resolved.agentId, turnId: msg.expectedTurnId },
+        "Failed to continue agent turn",
+      );
+      this.emit({
+        type: "agent.turn.continue_after_failure.response",
+        payload: {
+          requestId: msg.requestId,
+          agentId: resolved.agentId,
+          status: "refused",
+          refusalReason: "continuation_unavailable",
+          receipt: null,
+        },
+      });
+    }
+  }
+
   private async handleFetchAgentTimelineRequest(
     msg: Extract<SessionInboundMessage, { type: "fetch_agent_timeline_request" }>,
     source?: object,
@@ -8047,8 +8225,10 @@ export class Session {
       return;
     }
 
+    let releaseAdmission: (() => void) | undefined;
     try {
       const agentId = resolved.agentId;
+      releaseAdmission = this.agentManager.beginPromptAdmission(agentId);
 
       const prompt = buildAgentPrompt(msg.text, msg.images, msg.attachments);
       this.sessionLogger.trace(
@@ -8114,6 +8294,10 @@ export class Session {
           error: errorToFriendlyMessage(error),
         },
       });
+    } finally {
+      // This admission starts before prompt preparation and receipt lookup, so a
+      // continuation cannot overtake a prompt already accepted by this session.
+      releaseAdmission?.();
     }
   }
 

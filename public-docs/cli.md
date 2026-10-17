@@ -230,6 +230,130 @@ paseo logs <id> --tail 10        # Last 10 entries
 paseo logs <id> --filter tools   # Only tool calls
 ```
 
+## Observing and continuing a failed turn
+
+An external controller can inspect the last turn or request an exact turn, then
+continue the same provider session only when the daemon proves the failed turn
+had no assistant actions or tool effects. Paseo does not retry turns or choose
+prompts, providers, or models.
+
+```bash
+paseo agent observe-turn <id> --json
+paseo agent observe-turn <id> --turn <turn-id> --json
+paseo agent continue-after-failure <id> \
+  --expect-turn <turn-id> \
+  --expect-config-digest <digest> \
+  --idempotency-key <controller-key> \
+  --prompt-file continuation.txt \
+  --json
+```
+
+`observe-turn` returns a stable JSON object with `agentId`, `turnId`, `status`,
+`provider`, `workspaceId`, the model, thinking effort and mode used by that
+turn, `configDigest`, `configComplete`, timestamps, `error`, `effects`,
+`complete`, and `truncated`. A missing or unreadable turn is returned with
+`status: "unknown"`, `complete: false`, and `effects.state: "unknown"`.
+Turns without a persisted observation, including turns from before this feature
+was enabled, are returned as unknown; Paseo does not reconstruct them from log
+text.
+When Codex rejects `turn/start` with a typed overload before returning a native
+turn ID, Paseo uses a durable `paseo-start-<uuid>` attempt ID for that failed
+turn.
+
+```json
+{
+  "agentId": "agent-uuid",
+  "turnId": "turn-123",
+  "status": "failed",
+  "provider": "codex",
+  "workspaceId": "workspace-uuid",
+  "model": "gpt-5.4",
+  "thinkingEffort": "high",
+  "mode": "default",
+  "configDigest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "configComplete": true,
+  "startedAt": "2026-10-17T08:00:00.000Z",
+  "finishedAt": "2026-10-17T08:00:01.000Z",
+  "error": {
+    "providerCode": "server_overloaded",
+    "providerClass": "server_overloaded",
+    "rawMessage": "Selected model is at capacity. Please try a different model.",
+    "normalizedClass": "capacity_overload"
+  },
+  "effects": { "state": "none_proven" },
+  "complete": true,
+  "truncated": false
+}
+```
+
+The normalized error class is set only for the typed provider code or class
+`server_overloaded`; Paseo does not infer overload from the message text or
+remaining allowance. Codex turn telemetry provides the supported complete
+effect manifest. Other providers return `effects.state: "unknown"` and cannot
+pass continuation checks. The manifest records tool calls, file writes, shell
+commands, message deliveries, subagent spawns, and assistant responses. An
+unknown or truncated manifest cannot authorize continuation.
+
+When `effects.state` is `present`, the object contains `toolCalls` entries with
+`callId`, `name`, and `status`; `fileWrites` entries with `callId`, `path`, and
+`status`; `shellCommands` entries with `callId`, `command`, and `status`;
+`messageDeliveries` entries with `callId`, `name`, and `status`;
+`subAgentSpawns` entries with `id` and `status`; and an `assistantResponses`
+count. Status is `running`, `completed`, `failed`, or `canceled`. For
+`effects.state: "unknown"`, the same partial manifest is under `observed`, with
+a `reason`. A prompt steered into an active turn is recorded as an
+`agent_prompt` message delivery.
+
+`configDigest` is lowercase SHA-256 hex over the agent, workspace, provider,
+model, thinking effort, and mode used by that turn. `continue-after-failure`
+requires the exact failed last turn ID, its config digest, an idempotency key,
+and exactly one caller-supplied prompt (`--prompt`
+or `--prompt-file`). The prompt is sent verbatim to the same agent session.
+The daemon verifies there is no active turn or admitted prompt, the turn is
+failed and complete with `effects.state: "none_proven"`, the agent remains
+unarchived, and its current configuration still matches the observed digest.
+Refusals have a stable `refusalReason`; no prompt is sent when a check fails.
+An agent with no loaded live provider session, or an archived or closed agent,
+is refused.
+
+Continuation JSON always has `agentId`, `status`, `refusalReason`, and `receipt`.
+`status` is `started`, `outcome_unknown`, or `refused`. A successful receipt has
+`key`, `agentId`, `turnId`, `newTurnId`, `createdAt`, `updatedAt`,
+`configDigest`, and `state` (`pending`, `outcome_unknown`, or `started`).
+`refusalReason` is one of `invalid_idempotency_key`,
+`idempotency_key_conflict`, `observation_unavailable`, `agent_not_found`,
+`agent_archived`, `agent_closed`, `agent_not_loaded`, `agent_state_unreadable`,
+`continuation_in_progress`, `queued_prompt`, `config_mutation_in_progress`,
+`active_turn`, `turn_not_found`, `turn_mismatch`, `turn_not_failed`,
+`telemetry_incomplete`, `telemetry_unreadable`, `effects_not_none_proven`,
+`config_incomplete`, `config_changed`, or `continuation_unavailable`.
+
+```json
+{
+  "agentId": "agent-uuid",
+  "status": "started",
+  "refusalReason": null,
+  "receipt": {
+    "key": "controller-attempt-1",
+    "agentId": "agent-uuid",
+    "turnId": "turn-123",
+    "newTurnId": "turn-124",
+    "createdAt": "2026-10-17T08:01:00.000Z",
+    "updatedAt": "2026-10-17T08:01:00.100Z",
+    "configDigest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "state": "started"
+  }
+}
+```
+
+Receipts are stored under the daemon's `PASEO_HOME` and survive restart. A
+repeated key with the same parameters returns the same receipt without
+starting another turn. Reusing a key with different parameters returns
+`idempotency_key_conflict`. A receipt in `pending` or `outcome_unknown` state
+must be reconciled by the controller and is never resent automatically.
+These RPCs require the `agentTurnRecovery` host feature; existing inspect and
+logs output remains unchanged.
+
 ## Waiting for agents
 
 Block until an agent finishes its current task:

@@ -81,6 +81,8 @@ describe("SessionAuthorization", () => {
       "send_agent_message_request",
       "fetch_agent_request",
       "agent.timeline.set_subscription.request",
+      "agent.turn.observe.request",
+      "agent.turn.continue_after_failure.request",
       "workspace.recovery.inspect.request",
       "workspace.recovery.restore.request",
     ] as const) {
@@ -91,6 +93,8 @@ describe("SessionAuthorization", () => {
       "agent_update",
       "agent_stream",
       "send_agent_message_response",
+      "agent.turn.observe.response",
+      "agent.turn.continue_after_failure.response",
       "workspace.recovery.restore.response",
     ] as const) {
       expect(authorization.allowsOutbound(outboundMessage(type))).toBe(true);

@@ -405,6 +405,8 @@ export type AgentStreamEvent =
       provider: AgentProvider;
       error: string;
       code?: string;
+      providerCode?: string | number;
+      providerClass?: string;
       diagnostic?: string;
       turnId?: string;
     }

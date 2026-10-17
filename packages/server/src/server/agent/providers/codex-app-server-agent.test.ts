@@ -691,6 +691,32 @@ process.stdin.on("data", (chunk) => {
 }
 
 describe("Codex app-server provider", () => {
+  test("preserves typed overload codes and classes from failed turns", () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    asInternals(session).handleNotification("turn/completed", {
+      threadId: "test-thread",
+      turn: {
+        status: "failed",
+        error: {
+          message: "Selected model is at capacity. Please try a different model.",
+          code: "server_overloaded",
+          type: "server_overloaded",
+        },
+      },
+    });
+
+    expect(events.at(-1)).toMatchObject({
+      type: "turn_failed",
+      provider: "codex",
+      error: "Selected model is at capacity. Please try a different model.",
+      providerCode: "server_overloaded",
+      providerClass: "server_overloaded",
+    });
+  });
+
   test("getAvailableModes includes auto-review when the Codex version supports it", async () => {
     const session = createSession({}, { autoReviewEnabled: true });
 

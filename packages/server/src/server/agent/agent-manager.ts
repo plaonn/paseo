@@ -88,6 +88,13 @@ import {
   type ProviderSubagentDescriptor,
   type ProviderSubagentStoreEvent,
 } from "./provider-subagents/store.js";
+import {
+  AgentTurnObservationStore,
+  digestAgentTurnConfig,
+  type AgentTurnContinuationPreparation,
+  type AgentTurnContinuationResult,
+  type AgentTurnObservation,
+} from "./agent-turn-observation-store.js";
 import { withTimeout } from "../../utils/promise-timeout.js";
 import { extractAttention } from "../persistence-hooks.js";
 
@@ -300,6 +307,7 @@ export interface AgentManagerOptions {
   onAgentAttention?: AgentAttentionCallback;
   onWorkspaceStateMayHaveChanged?: (params: { cwd: string }) => void;
   durableTimelineStore?: AgentTimelineStore;
+  turnObservationStore?: AgentTurnObservationStore;
   terminalManager?: TerminalManager | null;
   mcpBaseUrl?: string;
   mcpAuthToken?: string;
@@ -472,6 +480,50 @@ type ActiveManagedAgent =
   | ManagedAgentIdle
   | ManagedAgentRunning
   | ManagedAgentError;
+
+type ContinuationAgentResult =
+  | { status: "ready"; agent: ActiveManagedAgent }
+  | {
+      status: "refused";
+      reason: Extract<AgentTurnContinuationPreparation, { status: "refused" }>["reason"];
+    };
+
+function agentTurnConfig(agent: {
+  config: AgentSessionConfig;
+  currentModeId: string | null;
+  runtimeInfo?: AgentRuntimeInfo;
+}): { model: string | null; thinkingEffort: string | null; mode: string | null } {
+  return {
+    model: agent.runtimeInfo?.model ?? agent.config.model ?? null,
+    thinkingEffort: agent.runtimeInfo?.thinkingOptionId ?? agent.config.thinkingOptionId ?? null,
+    mode: agent.runtimeInfo?.modeId ?? agent.currentModeId ?? agent.config.modeId ?? null,
+  };
+}
+
+function providerFailureDetails(
+  provider: AgentProvider,
+  error: unknown,
+): { providerCode?: string | number; providerClass?: string } {
+  if (provider !== "codex" || typeof error !== "object" || error === null) return {};
+  const value = error as { code?: unknown; type?: unknown };
+  const details: { providerCode?: string | number; providerClass?: string } = {};
+  if (typeof value.code === "string" || typeof value.code === "number") {
+    details.providerCode = value.code;
+  }
+  if (typeof value.type === "string") details.providerClass = value.type;
+  return details;
+}
+
+function isTypedCapacityRejection(
+  provider: AgentProvider,
+  providerCode: string | number | undefined,
+  providerClass: string | undefined,
+): boolean {
+  return (
+    provider === "codex" &&
+    (providerCode === "server_overloaded" || providerClass === "server_overloaded")
+  );
+}
 
 type LiveManagedAgent = ActiveManagedAgent;
 type AgentLabelPatch = Record<string, string | null>;
@@ -708,12 +760,18 @@ export class AgentManager {
   private readonly idFactory: () => string;
   private readonly registry?: AgentStorage;
   private readonly durableTimelineStore?: AgentTimelineStore;
+  private readonly turnObservationStore?: AgentTurnObservationStore;
   private readonly previousStatuses = new Map<string, AgentLifecycleStatus>();
   private readonly backgroundTasks = new Set<Promise<void>>();
   private readonly agentRegistrationTasks = new Set<Promise<void>>();
   private readonly inFlightAgentCloses = new Map<string, Promise<void>>();
   private readonly reloadedSessionCloses = new WeakMap<AgentSession, Promise<void>>();
   private readonly lifecycleMutationTails = new Map<string, Promise<void>>();
+  private readonly continuationReservations = new Map<string, symbol>();
+  private readonly promptAdmissionCounts = new Map<string, number>();
+  private readonly configMutationCounts = new Map<string, number>();
+  private readonly turnObservationFailures = new Map<string, Set<string>>();
+  private readonly turnObservationUnavailable = new Set<string>();
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
   private readonly mcpAuthToken: string | null;
@@ -737,6 +795,7 @@ export class AgentManager {
     this.idFactory = options?.idFactory ?? (() => randomUUID());
     this.registry = options?.registry;
     this.durableTimelineStore = options?.durableTimelineStore;
+    this.turnObservationStore = options.turnObservationStore;
     this.onAgentAttention = options?.onAgentAttention;
     this.onWorkspaceStateMayHaveChanged = options?.onWorkspaceStateMayHaveChanged;
     this.mcpBaseUrl = options?.mcpBaseUrl ?? null;
@@ -918,6 +977,266 @@ export class AgentManager {
       Boolean(agent.activeForegroundTurnId) ||
       this.runs.hasRun(agentId)
     );
+  }
+
+  beginPromptAdmission(agentId: string): () => void {
+    if (this.continuationReservations.has(agentId)) {
+      throw Object.assign(new Error("Agent continuation is being admitted"), {
+        code: "agent_continuation_in_progress",
+      });
+    }
+    const count = this.promptAdmissionCounts.get(agentId) ?? 0;
+    this.promptAdmissionCounts.set(agentId, count + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const remaining = (this.promptAdmissionCounts.get(agentId) ?? 1) - 1;
+      if (remaining > 0) this.promptAdmissionCounts.set(agentId, remaining);
+      else this.promptAdmissionCounts.delete(agentId);
+    };
+  }
+
+  private beginConfigMutation(agentId: string): () => void {
+    if (this.continuationReservations.has(agentId)) {
+      throw Object.assign(new Error("Agent continuation is being admitted"), {
+        code: "agent_continuation_in_progress",
+      });
+    }
+    const count = this.configMutationCounts.get(agentId) ?? 0;
+    this.configMutationCounts.set(agentId, count + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const remaining = (this.configMutationCounts.get(agentId) ?? 1) - 1;
+      if (remaining > 0) this.configMutationCounts.set(agentId, remaining);
+      else this.configMutationCounts.delete(agentId);
+    };
+  }
+
+  async observeTurn(agentId: string, turnId?: string): Promise<AgentTurnObservation | null> {
+    if (!this.turnObservationStore) return null;
+    return this.turnObservationStore.observeTurn(agentId, turnId);
+  }
+
+  async recordPromptDelivery(agentId: string, turnId?: string): Promise<void> {
+    if (!this.turnObservationStore || !turnId) return;
+    try {
+      await this.turnObservationStore.recordMessageDelivery(agentId, turnId, {
+        callId: randomUUID(),
+        name: "agent_prompt",
+        status: "completed",
+      });
+    } catch (error) {
+      await this.markTurnObservationIncomplete(agentId, turnId);
+      this.logger.error(
+        { err: error, agentId, turnId },
+        "Failed to persist agent prompt delivery observation",
+      );
+    }
+  }
+
+  async continueAfterFailure(input: {
+    agentId: string;
+    expectedTurnId: string;
+    expectedConfigDigest: string;
+    idempotencyKey: string;
+    prompt: string;
+  }): Promise<AgentTurnContinuationResult> {
+    const store = this.turnObservationStore;
+    if (!store) return { status: "refused", reason: "observation_unavailable" };
+
+    return this.runLifecycleMutation(input.agentId, () =>
+      store.runContinuation(
+        {
+          key: input.idempotencyKey,
+          parameters: {
+            agentId: input.agentId,
+            expectedTurnId: input.expectedTurnId,
+            expectedConfigDigest: input.expectedConfigDigest,
+            prompt: input.prompt,
+          },
+        },
+        () => this.prepareContinuation(input, store),
+      ),
+    );
+  }
+
+  private continuationAdmissionRefusal(
+    agentId: string,
+  ): Extract<AgentTurnContinuationPreparation, { status: "refused" }> | null {
+    if (this.turnObservationUnavailable.has(agentId)) {
+      return { status: "refused", reason: "telemetry_incomplete" };
+    }
+    if (this.continuationReservations.has(agentId)) {
+      return { status: "refused", reason: "continuation_in_progress" };
+    }
+    if ((this.promptAdmissionCounts.get(agentId) ?? 0) > 0) {
+      return { status: "refused", reason: "queued_prompt" };
+    }
+    if ((this.configMutationCounts.get(agentId) ?? 0) > 0) {
+      return { status: "refused", reason: "config_mutation_in_progress" };
+    }
+    return null;
+  }
+
+  private async loadContinuationAgent(agentId: string): Promise<ContinuationAgentResult> {
+    let record: StoredAgentRecord | null | undefined;
+    try {
+      record = await this.registry?.get(agentId);
+    } catch {
+      return { status: "refused", reason: "agent_state_unreadable" };
+    }
+    if (!record) return { status: "refused", reason: "agent_not_found" };
+    if (record.archivedAt) return { status: "refused", reason: "agent_archived" };
+    if (record.lastStatus === "closed") return { status: "refused", reason: "agent_closed" };
+    const agent = this.agents.get(agentId);
+    if (!agent || !("session" in agent) || !agent.session) {
+      return { status: "refused", reason: "agent_not_loaded" };
+    }
+    return { status: "ready", agent };
+  }
+
+  private async validateContinuationTurn(
+    input: { agentId: string; expectedTurnId: string; expectedConfigDigest: string },
+    store: AgentTurnObservationStore,
+    agent: ActiveManagedAgent,
+  ): Promise<
+    | Extract<AgentTurnContinuationPreparation, { status: "refused" }>
+    | { status: "ready"; turnId: string; configDigest: string }
+  > {
+    let requested: AgentTurnObservation | null;
+    let last: AgentTurnObservation | null;
+    try {
+      const pair = await store.observeExpectedAndLastTurn(input.agentId, input.expectedTurnId);
+      requested = pair.expected;
+      last = pair.last;
+    } catch {
+      return { status: "refused", reason: "telemetry_unreadable" };
+    }
+    const turnRefusal = this.observedTurnRefusal(input.expectedTurnId, requested, last);
+    if (turnRefusal) return turnRefusal;
+    if (!requested) return { status: "refused", reason: "turn_not_found" };
+    if (!requested.configComplete) return { status: "refused", reason: "config_incomplete" };
+    const currentConfigDigest = digestAgentTurnConfig({
+      agentId: agent.id,
+      workspaceId: agent.workspaceId ?? null,
+      provider: agent.provider,
+      ...agentTurnConfig(agent),
+    });
+    if (
+      requested.configDigest !== input.expectedConfigDigest ||
+      currentConfigDigest !== input.expectedConfigDigest
+    ) {
+      return { status: "refused", reason: "config_changed" };
+    }
+    return { status: "ready", turnId: requested.turnId, configDigest: currentConfigDigest };
+  }
+
+  private observedTurnRefusal(
+    expectedTurnId: string,
+    requested: AgentTurnObservation | null,
+    last: AgentTurnObservation | null,
+  ): Extract<AgentTurnContinuationPreparation, { status: "refused" }> | null {
+    if (!requested || !last) return { status: "refused", reason: "turn_not_found" };
+    if (last.turnId !== requested.turnId || requested.turnId !== expectedTurnId) {
+      return { status: "refused", reason: "turn_mismatch" };
+    }
+    if (requested.status !== "failed" || last.status !== "failed") {
+      return { status: "refused", reason: "turn_not_failed" };
+    }
+    if (!requested.complete || requested.truncated) {
+      return { status: "refused", reason: "telemetry_incomplete" };
+    }
+    if (requested.effects.state !== "none_proven") {
+      return { status: "refused", reason: "effects_not_none_proven" };
+    }
+    return null;
+  }
+
+  private async startContinuation(
+    agentId: string,
+    prompt: string,
+    reservation: symbol,
+  ): Promise<string> {
+    const iterator = this.streamAgentInternal(agentId, prompt, undefined, reservation);
+    const first = await iterator.next();
+    if (first.done || first.value.type !== "turn_started" || !first.value.turnId) {
+      throw new Error("Continuation turn did not produce a stable turn ID");
+    }
+    const newTurnId = first.value.turnId;
+    const drain = (async () => {
+      for await (const _event of iterator) {
+        // AgentManager subscribers receive the streamed turn events.
+      }
+    })().catch((error: unknown) => {
+      this.logger.error(
+        { err: error, agentId, turnId: newTurnId },
+        "Failed to drain continuation turn",
+      );
+    });
+    this.trackBackgroundTask(drain);
+    return newTurnId;
+  }
+
+  private async prepareContinuation(
+    input: {
+      agentId: string;
+      expectedTurnId: string;
+      expectedConfigDigest: string;
+      prompt: string;
+    },
+    store: AgentTurnObservationStore,
+  ): Promise<AgentTurnContinuationPreparation> {
+    const refusal = this.continuationAdmissionRefusal(input.agentId);
+    if (refusal) return refusal;
+    const reservation = Symbol(input.agentId);
+    this.continuationReservations.set(input.agentId, reservation);
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      if (this.continuationReservations.get(input.agentId) === reservation) {
+        this.continuationReservations.delete(input.agentId);
+      }
+    };
+    try {
+      const agentResult = await this.loadContinuationAgent(input.agentId);
+      if (agentResult.status === "refused") {
+        release();
+        return agentResult;
+      }
+      const agent = agentResult.agent;
+      await this.drainSessionEvents(input.agentId);
+      this.agentStreamCoalescer.flushFor(input.agentId);
+      await this.drainSessionEvents(input.agentId);
+      if (
+        agent.activeTurnId ||
+        agent.activeForegroundTurnId ||
+        this.runs.hasRun(input.agentId) ||
+        agent.pendingReplacement
+      ) {
+        release();
+        return { status: "refused", reason: "active_turn" };
+      }
+      const validation = await this.validateContinuationTurn(input, store, agent);
+      if (validation.status === "refused") {
+        release();
+        return validation;
+      }
+      return {
+        status: "prepared",
+        agentId: input.agentId,
+        turnId: validation.turnId,
+        configDigest: validation.configDigest,
+        release,
+        start: () => this.startContinuation(input.agentId, input.prompt, reservation),
+      };
+    } catch (error) {
+      release();
+      throw error;
+    }
   }
 
   subscribe(callback: AgentSubscriber, options?: SubscribeOptions): () => void {
@@ -1885,65 +2204,80 @@ export class AgentManager {
   }
 
   async setAgentMode(agentId: string, modeId: string): Promise<AgentProviderNotice | null> {
-    const agent = this.requireSessionAgent(agentId);
-    const notice = (await agent.session.setMode(modeId)) ?? null;
-    await this.drainSessionEvents(agentId);
-    const currentMode = (await agent.session.getCurrentMode()) ?? modeId;
-    agent.config.modeId = currentMode ?? undefined;
-    agent.currentModeId = currentMode;
-    // Update runtimeInfo to reflect the new mode
-    if (agent.runtimeInfo) {
-      agent.runtimeInfo = { ...agent.runtimeInfo, modeId: currentMode };
+    const releaseMutation = this.beginConfigMutation(agentId);
+    try {
+      const agent = this.requireSessionAgent(agentId);
+      const notice = (await agent.session.setMode(modeId)) ?? null;
+      await this.drainSessionEvents(agentId);
+      const currentMode = (await agent.session.getCurrentMode()) ?? modeId;
+      agent.config.modeId = currentMode ?? undefined;
+      agent.currentModeId = currentMode;
+      // Update runtimeInfo to reflect the new mode
+      if (agent.runtimeInfo) {
+        agent.runtimeInfo = { ...agent.runtimeInfo, modeId: currentMode };
+      }
+      this.touchUpdatedAt(agent);
+      this.emitState(agent);
+      return notice;
+    } finally {
+      releaseMutation();
     }
-    this.touchUpdatedAt(agent);
-    this.emitState(agent);
-    return notice;
   }
 
   async setAgentModel(agentId: string, modelId: string | null): Promise<void> {
-    const agent = this.requireSessionAgent(agentId);
-    const normalizedModelId =
-      typeof modelId === "string" && modelId.trim().length > 0 ? modelId : null;
+    const releaseMutation = this.beginConfigMutation(agentId);
+    try {
+      const agent = this.requireSessionAgent(agentId);
+      const normalizedModelId =
+        typeof modelId === "string" && modelId.trim().length > 0 ? modelId : null;
 
-    if (agent.session.setModel) {
-      await agent.session.setModel(normalizedModelId);
-    }
-    await this.drainSessionEvents(agentId);
+      if (agent.session.setModel) {
+        await agent.session.setModel(normalizedModelId);
+      }
+      await this.drainSessionEvents(agentId);
 
-    agent.config.model = normalizedModelId ?? undefined;
-    if (agent.runtimeInfo) {
-      agent.runtimeInfo = { ...agent.runtimeInfo, model: normalizedModelId };
+      agent.config.model = normalizedModelId ?? undefined;
+      if (agent.runtimeInfo) {
+        agent.runtimeInfo = { ...agent.runtimeInfo, model: normalizedModelId };
+      }
+      this.touchUpdatedAt(agent);
+      this.emitState(agent);
+    } finally {
+      releaseMutation();
     }
-    this.touchUpdatedAt(agent);
-    this.emitState(agent);
   }
 
   async setAgentThinkingOption(
     agentId: string,
     thinkingOptionId: string | null,
   ): Promise<AgentProviderNotice | null> {
-    const agent = this.requireSessionAgent(agentId);
-    const normalizedThinkingOptionId =
-      typeof thinkingOptionId === "string" && thinkingOptionId.trim().length > 0
-        ? thinkingOptionId
-        : null;
+    const releaseMutation = this.beginConfigMutation(agentId);
+    try {
+      const agent = this.requireSessionAgent(agentId);
+      const normalizedThinkingOptionId =
+        typeof thinkingOptionId === "string" && thinkingOptionId.trim().length > 0
+          ? thinkingOptionId
+          : null;
 
-    let notice: AgentProviderNotice | null = null;
-    if (agent.session.setThinkingOption) {
-      notice = (await agent.session.setThinkingOption(normalizedThinkingOptionId)) ?? null;
-    }
-    await this.drainSessionEvents(agentId);
+      let notice: AgentProviderNotice | null = null;
+      if (agent.session.setThinkingOption) {
+        notice = (await agent.session.setThinkingOption(normalizedThinkingOptionId)) ?? null;
+      }
+      await this.drainSessionEvents(agentId);
 
-    agent.config.thinkingOptionId = normalizedThinkingOptionId ?? undefined;
-    if (agent.runtimeInfo) {
-      agent.runtimeInfo = {
-        ...agent.runtimeInfo,
-        thinkingOptionId: normalizedThinkingOptionId,
-      };
+      agent.config.thinkingOptionId = normalizedThinkingOptionId ?? undefined;
+      if (agent.runtimeInfo) {
+        agent.runtimeInfo = {
+          ...agent.runtimeInfo,
+          thinkingOptionId: normalizedThinkingOptionId,
+        };
+      }
+      this.touchUpdatedAt(agent);
+      this.emitState(agent);
+      return notice;
+    } finally {
+      releaseMutation();
     }
-    this.touchUpdatedAt(agent);
-    this.emitState(agent);
-    return notice;
   }
 
   async setAgentFeature(agentId: string, featureId: string, value: unknown): Promise<void> {
@@ -2418,14 +2752,66 @@ export class AgentManager {
       agent.pendingReplacement = false;
       const errorMsg = error instanceof Error ? error.message : "Failed to start turn";
       pendingRun.start = { status: "failed", error: errorMsg };
-      await this.handleStreamEvent(agent, {
-        type: "turn_failed",
-        provider: agent.provider,
-        error: errorMsg,
-      });
+      const failedStartTurnId = `paseo-start-${pendingRun.token}`;
+      await this.recordFailedTurnStart(agent, agentId, failedStartTurnId, error, errorMsg);
       this.finalizeForegroundTurn(agent);
       this.runs.settleForegroundRun(agentId, pendingRun.token);
       throw error;
+    }
+  }
+
+  private async recordFailedTurnStart(
+    agent: ActiveManagedAgent,
+    agentId: string,
+    turnId: string,
+    error: unknown,
+    errorMsg: string,
+  ): Promise<void> {
+    const { providerCode, providerClass } = providerFailureDetails(agent.provider, error);
+    await this.persistFailedTurnStartObservation(
+      agent,
+      agentId,
+      turnId,
+      providerCode,
+      providerClass,
+    );
+    await this.handleStreamEvent(agent, {
+      type: "turn_failed",
+      provider: agent.provider,
+      turnId,
+      error: errorMsg,
+      ...(providerCode !== undefined ? { code: String(providerCode), providerCode } : {}),
+      ...(providerClass !== undefined ? { providerClass } : {}),
+    });
+  }
+
+  private async persistFailedTurnStartObservation(
+    agent: ActiveManagedAgent,
+    agentId: string,
+    turnId: string,
+    providerCode: string | number | undefined,
+    providerClass: string | undefined,
+  ): Promise<void> {
+    const store = this.turnObservationStore;
+    if (!store) return;
+    try {
+      await store.startTurn({
+        agentId,
+        turnId,
+        workspaceId: agent.workspaceId ?? null,
+        provider: agent.provider,
+        config: agentTurnConfig(agent),
+      });
+      if (!isTypedCapacityRejection(agent.provider, providerCode, providerClass)) {
+        await store.markTelemetryIncomplete(agentId, turnId);
+      }
+    } catch (observationError) {
+      this.turnObservationUnavailable.add(agentId);
+      await this.markLatestTurnObservationIncomplete(agentId);
+      this.logger.error(
+        { err: observationError, agentId, turnId },
+        "Failed to persist failed agent turn start observation",
+      );
     }
   }
 
@@ -2434,6 +2820,21 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
   ): AsyncGenerator<AgentStreamEvent> {
+    return this.streamAgentInternal(agentId, prompt, options);
+  }
+
+  private streamAgentInternal(
+    agentId: string,
+    prompt: AgentPromptInput,
+    options?: AgentRunOptions,
+    continuationReservation?: symbol,
+  ): AsyncGenerator<AgentStreamEvent> {
+    const reservation = this.continuationReservations.get(agentId);
+    if (reservation && reservation !== continuationReservation) {
+      throw Object.assign(new Error("Agent continuation is being admitted"), {
+        code: "agent_continuation_in_progress",
+      });
+    }
     const existingAgent = this.requireSessionAgent(agentId);
     this.logger.trace(
       {
@@ -2471,74 +2872,22 @@ export class AgentManager {
     const pendingRun = this.runs.createPendingRun(agentId);
 
     const streamForwarder = async function* streamForwarder(this: AgentManager) {
-      let turnId: string;
-      let turnStream: ReturnType<AgentRunState["createTurnStream"]> | null = null;
-      turnId = await this.startPendingForegroundTurn({
+      const turnId = await this.startPendingForegroundTurn({
         agent,
         agentId,
         pendingRun,
         prompt,
         options,
       });
-
-      if (isReplacement) {
-        agent.pendingReplacement = false;
-      }
-      const turnStartedAt = new Date();
-      pendingRun.start = { status: "started", turnId };
-      agent.activeForegroundTurnId = turnId;
-      this.openActiveTurn(agent, turnId, turnStartedAt);
-      agent.lifecycle = "running";
-      this.touchUpdatedAt(agent);
-      // AgentManager owns the accepted-turn boundary. Publish liveness before the canonical
-      // prompt so clients can retire optimistic activity without painting an idle frame.
-      // The provider's duplicate start for this turn is suppressed at the ingestion boundary.
-      this.dispatchStream(
-        agent.id,
-        { type: "turn_started", provider: agent.provider, turnId },
-        { timestamp: turnStartedAt.toISOString() },
-      );
-      const stagedSubmittedPromptEcho = options?.clientMessageId
-        ? pendingRun.stagedEvents.find(
-            (event): event is Extract<AgentStreamEvent, { type: "timeline" }> =>
-              event.type === "timeline" &&
-              event.item.type === "user_message" &&
-              event.item.clientMessageId === options.clientMessageId,
-          )
-        : undefined;
-      if (options?.clientMessageId) {
-        this.recordSubmittedPrompt(agent, prompt, options.clientMessageId, {
-          messageId: options.clientMessageId,
-          turnId,
-          providerMessageId:
-            stagedSubmittedPromptEcho?.item.type === "user_message"
-              ? stagedSubmittedPromptEcho.item.messageId
-              : undefined,
-        });
-      }
-      for (const stagedEvent of pendingRun.stagedEvents.splice(0)) {
-        const isAcceptedTurnStart =
-          stagedEvent.type === "turn_started" && getAgentStreamEventTurnId(stagedEvent) === turnId;
-        if (isAcceptedTurnStart || stagedEvent === stagedSubmittedPromptEcho) {
-          continue;
-        }
-        this.enqueueSessionEvent(agent.id, stagedEvent);
-      }
-      this.emitState(agent);
-      this.logger.trace(
-        {
-          agentId,
-          provider: agent.provider,
-          sessionId: agent.persistence?.sessionId ?? undefined,
-          turnId,
-          lifecycle: agent.lifecycle,
-          activeForegroundTurnId: agent.activeForegroundTurnId,
-        },
-        "agent.manager.stream.start",
-      );
-
-      turnStream = this.runs.createTurnStream(turnId);
-      this.runs.addWaiter(agent, turnStream.waiter);
+      const turnStream = await this.openForegroundTurn({
+        agent,
+        agentId,
+        pendingRun,
+        turnId,
+        prompt,
+        isReplacement,
+        options,
+      });
 
       try {
         const acceptedTurnStartedEvent: AgentStreamEvent = {
@@ -2551,9 +2900,7 @@ export class AgentManager {
           yield event;
         }
       } finally {
-        if (turnStream) {
-          this.runs.deleteWaiter(agent, turnStream.waiter);
-        }
+        this.runs.deleteWaiter(agent, turnStream.waiter);
         this.runs.settleForegroundRun(agentId, pendingRun.token);
         if (!agent.activeForegroundTurnId) {
           await this.refreshRuntimeInfo(agent);
@@ -2562,6 +2909,100 @@ export class AgentManager {
     }.call(this);
 
     return streamForwarder;
+  }
+
+  private async openForegroundTurn(input: {
+    agent: ActiveManagedAgent;
+    agentId: string;
+    pendingRun: PendingForegroundRun;
+    turnId: string;
+    prompt: AgentPromptInput;
+    isReplacement: boolean;
+    options?: AgentRunOptions;
+  }): Promise<ReturnType<AgentRunState["createTurnStream"]>> {
+    const { agent, agentId, pendingRun, turnId, prompt, isReplacement, options } = input;
+    if (isReplacement) agent.pendingReplacement = false;
+    const turnStartedAt = new Date();
+    if (this.turnObservationStore) {
+      await this.persistStartedTurnObservation(agent, turnId, turnStartedAt);
+    }
+    pendingRun.start = { status: "started", turnId };
+    agent.activeForegroundTurnId = turnId;
+    this.openActiveTurn(agent, turnId, turnStartedAt);
+    agent.lifecycle = "running";
+    this.touchUpdatedAt(agent);
+    // AgentManager owns the accepted-turn boundary. Publish liveness before the canonical
+    // prompt so clients can retire optimistic activity without painting an idle frame.
+    // The provider's duplicate start for this turn is suppressed at the ingestion boundary.
+    this.dispatchStream(
+      agent.id,
+      { type: "turn_started", provider: agent.provider, turnId },
+      { timestamp: turnStartedAt.toISOString() },
+    );
+    const stagedSubmittedPromptEcho = options?.clientMessageId
+      ? pendingRun.stagedEvents.find(
+          (event): event is Extract<AgentStreamEvent, { type: "timeline" }> =>
+            event.type === "timeline" &&
+            event.item.type === "user_message" &&
+            event.item.clientMessageId === options.clientMessageId,
+        )
+      : undefined;
+    if (options?.clientMessageId) {
+      this.recordSubmittedPrompt(agent, prompt, options.clientMessageId, {
+        messageId: options.clientMessageId,
+        turnId,
+        providerMessageId:
+          stagedSubmittedPromptEcho?.item.type === "user_message"
+            ? stagedSubmittedPromptEcho.item.messageId
+            : undefined,
+      });
+    }
+    for (const stagedEvent of pendingRun.stagedEvents.splice(0)) {
+      const isAcceptedTurnStart =
+        stagedEvent.type === "turn_started" && getAgentStreamEventTurnId(stagedEvent) === turnId;
+      if (!isAcceptedTurnStart && stagedEvent !== stagedSubmittedPromptEcho) {
+        this.enqueueSessionEvent(agent.id, stagedEvent);
+      }
+    }
+    this.emitState(agent);
+    this.logger.trace(
+      {
+        agentId,
+        provider: agent.provider,
+        sessionId: agent.persistence?.sessionId ?? undefined,
+        turnId,
+        lifecycle: agent.lifecycle,
+        activeForegroundTurnId: agent.activeForegroundTurnId,
+      },
+      "agent.manager.stream.start",
+    );
+    const turnStream = this.runs.createTurnStream(turnId);
+    this.runs.addWaiter(agent, turnStream.waiter);
+    return turnStream;
+  }
+
+  private async persistStartedTurnObservation(
+    agent: ActiveManagedAgent,
+    turnId: string,
+    startedAt: Date,
+  ): Promise<void> {
+    if (!this.turnObservationStore) return;
+    try {
+      await this.turnObservationStore.startTurn({
+        agentId: agent.id,
+        turnId,
+        workspaceId: agent.workspaceId ?? null,
+        provider: agent.provider,
+        config: agentTurnConfig(agent),
+        startedAt: startedAt.toISOString(),
+      });
+    } catch (error) {
+      this.turnObservationUnavailable.add(agent.id);
+      this.logger.error(
+        { err: error, agentId: agent.id, turnId },
+        "Failed to persist agent turn observation start",
+      );
+    }
   }
 
   private finalizeForegroundTurn(agent: ActiveManagedAgent, turnId?: string): void {
@@ -2631,6 +3072,11 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
   ): Promise<AsyncGenerator<AgentStreamEvent>> {
+    if (this.continuationReservations.has(agentId)) {
+      throw Object.assign(new Error("Agent continuation is being admitted"), {
+        code: "agent_continuation_in_progress",
+      });
+    }
     const snapshot = this.requireAgent(agentId);
     if (
       snapshot.lifecycle !== "running" &&
@@ -3770,11 +4216,58 @@ export class AgentManager {
     }
   }
 
+  private async recordProviderSubagentEffect(
+    agent: ActiveManagedAgent,
+    event: Extract<AgentStreamEvent, { type: "provider_subagent" }>["event"] & { type: "upsert" },
+  ): Promise<void> {
+    const activeTurnId = agent.activeForegroundTurnId ?? agent.activeTurnId;
+    const existing = this.providerSubagents.get(agent.id, event.id);
+    if (activeTurnId) {
+      try {
+        await this.turnObservationStore?.recordSubAgentSpawn(
+          agent.id,
+          activeTurnId,
+          event.id,
+          event.status ?? existing?.status ?? "running",
+        );
+      } catch (error) {
+        await this.markTurnObservationIncomplete(agent.id, activeTurnId);
+        this.logger.error(
+          { err: error, agentId: agent.id, turnId: activeTurnId, subAgentId: event.id },
+          "Failed to persist subagent effect observation",
+        );
+      }
+      return;
+    }
+    if (!existing) {
+      await this.markLatestTurnObservationIncomplete(agent.id);
+      return;
+    }
+    if (!event.status || !this.turnObservationStore) return;
+    try {
+      const updated = await this.turnObservationStore.updateSubAgentStatus(
+        agent.id,
+        event.id,
+        event.status,
+      );
+      if (!updated) await this.markLatestTurnObservationIncomplete(agent.id);
+    } catch (error) {
+      await this.markLatestTurnObservationIncomplete(agent.id);
+      this.logger.error(
+        { err: error, agentId: agent.id, subAgentId: event.id },
+        "Failed to update subagent effect observation",
+      );
+    }
+  }
+
   private async dispatchSessionEvent(
     agent: ActiveManagedAgent,
     event: AgentStreamEvent,
   ): Promise<void> {
     if (event.type === "provider_subagent") {
+      if (event.event.type === "upsert") {
+        await this.recordProviderSubagentEffect(agent, event.event);
+      }
       const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
       this.dispatch({ type: "provider_subagent", event: update });
       return;
@@ -4075,6 +4568,49 @@ export class AgentManager {
     );
   }
 
+  private async recordTurnObservationEvent(
+    agent: ActiveManagedAgent,
+    event: AgentStreamEvent,
+    turnId: string | undefined,
+    fromHistory: boolean,
+  ): Promise<void> {
+    const store = this.turnObservationStore;
+    if (fromHistory || !store) return;
+    if (!turnId) {
+      if (event.type === "timeline" || isTurnTerminalEvent(event)) {
+        await this.markLatestTurnObservationIncomplete(agent.id);
+      }
+      return;
+    }
+    try {
+      if (event.type === "timeline") {
+        await store.recordTimelineItem(agent.id, turnId, event.item);
+        return;
+      }
+      if (!isTurnTerminalEvent(event)) return;
+      let status: "completed" | "failed" | "cancelled" = "cancelled";
+      if (event.type === "turn_completed") status = "completed";
+      if (event.type === "turn_failed") status = "failed";
+      const failed = event.type === "turn_failed";
+      await store.finishTurn({
+        agentId: agent.id,
+        turnId,
+        status,
+        providerCode: failed ? (event.providerCode ?? null) : null,
+        providerClass: failed ? (event.providerClass ?? null) : null,
+        rawMessage: failed ? event.error : null,
+        telemetryIncomplete: this.hasTurnObservationFailure(agent.id, turnId),
+      });
+      this.clearTurnObservationFailure(agent.id, turnId);
+    } catch (error) {
+      await this.markTurnObservationIncomplete(agent.id, turnId);
+      this.logger.error(
+        { err: error, agentId: agent.id, turnId, eventType: event.type },
+        "Failed to persist agent turn observation event",
+      );
+    }
+  }
+
   private async handleStreamEvent(
     agent: ActiveManagedAgent,
     event: AgentStreamEvent,
@@ -4084,6 +4620,7 @@ export class AgentManager {
     const identified = attachManagedTurnIdentity(agent, event, options?.fromHistory === true);
     event = identified.event;
     const eventTurnId = identified.turnId;
+    await this.recordTurnObservationEvent(agent, event, eventTurnId, options?.fromHistory === true);
     const isForegroundEvent = agent.activeForegroundTurnId === eventTurnId;
     this.traceHandleStreamEventStart(agent, event, eventTurnId, isForegroundEvent);
     if (
@@ -4144,6 +4681,45 @@ export class AgentManager {
     this.traceHandleStreamEventEnd(agent, event, eventTurnId, flags);
 
     return flags.shouldNotifyWaiters;
+  }
+
+  private hasTurnObservationFailure(agentId: string, turnId: string): boolean {
+    return this.turnObservationFailures.get(agentId)?.has(turnId) ?? false;
+  }
+
+  private clearTurnObservationFailure(agentId: string, turnId: string): void {
+    const failedTurns = this.turnObservationFailures.get(agentId);
+    if (!failedTurns) return;
+    failedTurns.delete(turnId);
+    if (failedTurns.size === 0) this.turnObservationFailures.delete(agentId);
+  }
+
+  private async markTurnObservationIncomplete(agentId: string, turnId: string): Promise<void> {
+    let failedTurns = this.turnObservationFailures.get(agentId);
+    if (!failedTurns) {
+      failedTurns = new Set();
+      this.turnObservationFailures.set(agentId, failedTurns);
+    }
+    failedTurns.add(turnId);
+    try {
+      await this.turnObservationStore?.markTelemetryIncomplete(agentId, turnId);
+    } catch {
+      // The local marker is checked when a later terminal event is persisted.
+      this.turnObservationUnavailable.add(agentId);
+    }
+  }
+
+  private async markLatestTurnObservationIncomplete(agentId: string): Promise<void> {
+    try {
+      const last = await this.turnObservationStore?.observeTurn(agentId);
+      if (last) await this.markTurnObservationIncomplete(agentId, last.turnId);
+    } catch (error) {
+      this.turnObservationUnavailable.add(agentId);
+      this.logger.error(
+        { err: error, agentId },
+        "Failed to read the latest turn while reconciling unassigned telemetry",
+      );
+    }
   }
 
   private traceHandleStreamEventStart(

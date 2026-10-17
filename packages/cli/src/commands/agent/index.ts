@@ -14,6 +14,11 @@ import { addReloadOptions, runReloadCommand } from "./reload.js";
 import { addImportOptions, runImportCommand } from "./import.js";
 import { runUpdateCommand } from "./update.js";
 import { runDetachCommand } from "./detach.js";
+import { addObserveTurnOptions, runObserveTurnCommand } from "./observe-turn.js";
+import {
+  addContinueAfterFailureOptions,
+  runContinueAfterFailureCommand,
+} from "./continue-after-failure.js";
 import { addOpenOptions, runOpenCommand } from "./open.js";
 import { withOutput } from "../../output/index.js";
 import {
@@ -64,6 +69,14 @@ export function createAgentCommand(): Command {
   addJsonAndDaemonHostOptions(addInspectOptions(agent.command("inspect"))).action(
     withOutput(runInspectCommand),
   );
+
+  addJsonAndDaemonHostOptions(addObserveTurnOptions(agent.command("observe-turn"))).action(
+    withOutput(runObserveTurnCommand),
+  );
+
+  addJsonAndDaemonHostOptions(
+    addContinueAfterFailureOptions(agent.command("continue-after-failure")),
+  ).action(withOutput(runContinueAfterFailureCommand));
 
   addJsonAndDaemonHostOptions(addWaitOptions(agent.command("wait"))).action(
     withOutput(runWaitCommand),

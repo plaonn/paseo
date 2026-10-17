@@ -25,6 +25,8 @@ import {
   DaemonUpdateResponseSchema,
   SessionInboundMessageSchema,
   type ActiveTurnBehavior,
+  type AgentTurnObservationPayload,
+  type AgentTurnContinuationReceiptPayload,
   type ServerInfoStatusPayload,
 } from "@getpaseo/protocol/messages";
 import { validateWSOutboundMessage } from "@getpaseo/protocol/validation/ws-outbound";
@@ -3164,6 +3166,61 @@ export class DaemonClient {
     return payload;
   }
 
+  async observeAgentTurn(
+    agentId: string,
+    options: { turnId?: string; requestId?: string; timeout?: number } = {},
+  ): Promise<AgentTurnObservationPayload> {
+    this.requireAgentTurnRecoverySupport();
+    const payload =
+      await this.sendNamespacedCorrelatedSessionRequest<"agent.turn.observe.response">({
+        requestId: options.requestId,
+        timeout: options.timeout,
+        message: {
+          type: "agent.turn.observe.request",
+          agentId,
+          ...(options.turnId !== undefined ? { turnId: options.turnId } : {}),
+        },
+      });
+    if (payload.error) throw new Error(payload.error);
+    return payload.observation;
+  }
+
+  async continueAfterFailure(input: {
+    agentId: string;
+    expectedTurnId: string;
+    expectedConfigDigest: string;
+    idempotencyKey: string;
+    prompt: string;
+    requestId?: string;
+    timeout?: number;
+  }): Promise<{
+    status: "started" | "outcome_unknown" | "refused";
+    refusalReason: string | null;
+    receipt: AgentTurnContinuationReceiptPayload | null;
+  }> {
+    this.requireAgentTurnRecoverySupport();
+    const payload =
+      await this.sendNamespacedCorrelatedSessionRequest<"agent.turn.continue_after_failure.response">(
+        {
+          requestId: input.requestId,
+          timeout: input.timeout,
+          message: {
+            type: "agent.turn.continue_after_failure.request",
+            agentId: input.agentId,
+            expectedTurnId: input.expectedTurnId,
+            expectedConfigDigest: input.expectedConfigDigest,
+            idempotencyKey: input.idempotencyKey,
+            prompt: input.prompt,
+          },
+        },
+      );
+    return {
+      status: payload.status,
+      refusalReason: payload.refusalReason,
+      receipt: payload.receipt,
+    };
+  }
+
   async appendAgentTimelineItem(
     agentId: string,
     item: Omit<import("@getpaseo/protocol/agent-types").PluginTimelineItem, "pluginId">,
@@ -5986,6 +6043,13 @@ export class DaemonClient {
     // COMPAT(daemonConfigReload): added in v0.4.0, remove gate after 2027-02-14.
     if (this.lastServerInfoMessage?.features?.daemonConfigReload !== true) {
       throw new Error("Update the host to reload daemon configuration.");
+    }
+  }
+
+  private requireAgentTurnRecoverySupport(): void {
+    // COMPAT(agentTurnRecovery): added in v0.9.0-beta.2, remove gate after 2027-10-17.
+    if (this.lastServerInfoMessage?.features?.agentTurnRecovery !== true) {
+      throw new Error("Update the host to use agent turn recovery.");
     }
   }
 

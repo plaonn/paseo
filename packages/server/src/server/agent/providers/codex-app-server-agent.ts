@@ -2128,6 +2128,8 @@ const TurnCompletedNotificationSchema = z
         error: z
           .object({
             message: z.string().optional(),
+            code: z.union([z.string(), z.number()]).optional(),
+            type: z.string().optional(),
           })
           .passthrough()
           .nullable()
@@ -2417,6 +2419,8 @@ type ParsedCodexNotification =
       kind: "turn_completed";
       status: string;
       errorMessage: string | null;
+      errorCode: string | number | null;
+      errorClass: string | null;
       threadId: string | null;
     }
   | {
@@ -2569,6 +2573,8 @@ const CodexNotificationSchema = z.union([
         kind: "turn_completed",
         status: params.turn.status,
         errorMessage: params.turn.error?.message ?? null,
+        errorCode: params.turn.error?.code ?? null,
+        errorClass: params.turn.error?.type ?? null,
         threadId: params.threadId ?? null,
       }),
     ),
@@ -2993,6 +2999,8 @@ const CodexNotificationSchema = z.union([
         kind: "turn_completed",
         status: "interrupted",
         errorMessage: null,
+        errorCode: null,
+        errorClass: null,
         threadId: getCodexEventThreadId(params),
       }),
     ),
@@ -3013,6 +3021,8 @@ const CodexNotificationSchema = z.union([
         kind: "turn_completed",
         status: "completed",
         errorMessage: null,
+        errorCode: null,
+        errorClass: null,
         threadId: getCodexEventThreadId(params),
       }),
     ),
@@ -5963,6 +5973,10 @@ export class CodexAppServerAgentSession implements AgentSession {
         type: "turn_failed",
         provider: CODEX_PROVIDER,
         error: parsed.errorMessage ?? "Codex turn failed",
+        ...(parsed.errorCode !== null
+          ? { code: String(parsed.errorCode), providerCode: parsed.errorCode }
+          : {}),
+        ...(parsed.errorClass !== null ? { providerClass: parsed.errorClass } : {}),
       });
     } else if (parsed.status === "interrupted") {
       this.dismissInterruptedAsyncQuestions();

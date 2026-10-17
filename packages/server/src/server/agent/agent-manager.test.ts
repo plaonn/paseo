@@ -15,6 +15,7 @@ import {
 } from "./agent-manager.js";
 import { AgentStorage } from "./agent-storage.js";
 import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
+import { AgentTurnObservationStore } from "./agent-turn-observation-store.js";
 import { toAgentPayload } from "./agent-projections.js";
 import { projectTimelineRows } from "./timeline-projection.js";
 import { getOpenAgentTabLabel, PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
@@ -11024,5 +11025,429 @@ test("concurrent native restores run once before resuming the same agent", async
     if (agentId) await manager.closeAgent(agentId);
     await storage.flush();
     rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+class TurnRecoverySession extends TestAgentSession {
+  readonly prompts: AgentPromptInput[] = [];
+  startCount = 0;
+
+  constructor(
+    config: AgentSessionConfig,
+    private readonly options: {
+      firstTimelineItem?: AgentTimelineItem;
+      holdSecondTurn?: boolean;
+      rejectFirstStart?: boolean;
+    } = {},
+  ) {
+    super(config);
+  }
+
+  override async startTurn(prompt: AgentPromptInput): Promise<{ turnId: string }> {
+    this.startCount += 1;
+    this.prompts.push(prompt);
+    const count = this.startCount;
+    const turnId = `recovery-turn-${count}`;
+    if (count === 1 && this.options.rejectFirstStart) {
+      throw Object.assign(
+        new Error("Selected model is at capacity. Please try a different model."),
+        { code: "server_overloaded" },
+      );
+    }
+    setTimeout(() => {
+      this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+      if (count === 1) {
+        if (this.options.firstTimelineItem) {
+          this.pushEvent({
+            type: "timeline",
+            provider: this.provider,
+            turnId,
+            item: this.options.firstTimelineItem,
+          });
+        }
+        this.pushEvent({
+          type: "turn_failed",
+          provider: this.provider,
+          turnId,
+          error: "Selected model is at capacity. Please try a different model.",
+          providerCode: "server_overloaded",
+          providerClass: "server_overloaded",
+        });
+        return;
+      }
+      if (!this.options.holdSecondTurn) {
+        this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+      }
+    }, 0);
+    return { turnId };
+  }
+
+  override async interrupt(): Promise<void> {
+    if (this.startCount > 1) {
+      this.pushEvent({
+        type: "turn_canceled",
+        provider: this.provider,
+        turnId: `recovery-turn-${this.startCount}`,
+        reason: "test cleanup",
+      });
+    }
+  }
+}
+
+async function createTurnRecoveryFixture(options?: {
+  firstTimelineItem?: AgentTimelineItem;
+  holdSecondTurn?: boolean;
+  rejectFirstStart?: boolean;
+}): Promise<{
+  manager: AgentManager;
+  storage: AgentStorage;
+  turnObservationStore: AgentTurnObservationStore;
+  session: TurnRecoverySession;
+  agentId: string;
+  workdir: string;
+}> {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-turn-recovery-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const sessionConfig: AgentSessionConfig = {
+    provider: "codex",
+    cwd: workdir,
+    model: "gpt-5.4",
+    thinkingOptionId: "high",
+    modeId: "default",
+  };
+  const session = new TurnRecoverySession(sessionConfig, options);
+  const client = new (class extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      return session;
+    }
+  })();
+  const turnObservationStore = new AgentTurnObservationStore(join(workdir, "paseo-home"));
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    turnObservationStore,
+    logger,
+  });
+  const agent = await manager.createAgent(sessionConfig, undefined, {
+    workspaceId: "workspace-recovery",
+  });
+  return { manager, storage, turnObservationStore, session, agentId: agent.id, workdir };
+}
+
+async function failFirstRecoveryTurn(manager: AgentManager, agentId: string) {
+  await expect(manager.runAgent(agentId, "original controller prompt")).rejects.toThrow(
+    "Selected model is at capacity",
+  );
+  const observation = await manager.observeTurn(agentId);
+  expect(observation?.turnId).toBe("recovery-turn-1");
+  return observation!;
+}
+
+function continuationInput(
+  agentId: string,
+  observation: NonNullable<Awaited<ReturnType<AgentManager["observeTurn"]>>>,
+  overrides: Partial<{
+    expectedTurnId: string;
+    expectedConfigDigest: string;
+    idempotencyKey: string;
+    prompt: string;
+  }> = {},
+) {
+  return {
+    agentId,
+    expectedTurnId: observation.turnId,
+    expectedConfigDigest: observation.configDigest,
+    idempotencyKey: "controller-attempt-1",
+    prompt: "controller continuation prompt, verbatim",
+    ...overrides,
+  };
+}
+
+test("continues a proven no-effect capacity failure once on the same provider session", async () => {
+  const fixture = await createTurnRecoveryFixture();
+  try {
+    const observation = await failFirstRecoveryTurn(fixture.manager, fixture.agentId);
+    expect(observation).toMatchObject({
+      status: "failed",
+      error: {
+        providerCode: "server_overloaded",
+        providerClass: "server_overloaded",
+        normalizedClass: "capacity_overload",
+      },
+      effects: { state: "none_proven" },
+      complete: true,
+      truncated: false,
+    });
+
+    const input = continuationInput(fixture.agentId, observation);
+    const first = await fixture.manager.continueAfterFailure(input);
+    const replay = await fixture.manager.continueAfterFailure(input);
+    const conflict = await fixture.manager.continueAfterFailure({ ...input, prompt: "changed" });
+
+    expect(first).toMatchObject({
+      status: "receipt",
+      replayed: false,
+      receipt: {
+        key: input.idempotencyKey,
+        agentId: fixture.agentId,
+        turnId: "recovery-turn-1",
+        newTurnId: "recovery-turn-2",
+        configDigest: observation.configDigest,
+        state: "started",
+      },
+    });
+    expect(replay).toEqual({ ...first, replayed: true });
+    expect(conflict).toEqual({ status: "refused", reason: "idempotency_key_conflict" });
+    expect(fixture.session.startCount).toBe(2);
+    expect(fixture.manager.getAgent(fixture.agentId)?.persistence?.sessionId).toBe(
+      fixture.session.id,
+    );
+    expect(fixture.session.prompts).toEqual([
+      "original controller prompt",
+      "controller continuation prompt, verbatim",
+    ]);
+  } finally {
+    await fixture.manager.closeAgent(fixture.agentId).catch(() => undefined);
+    await fixture.storage.flush();
+    rmSync(fixture.workdir, { recursive: true, force: true });
+  }
+});
+
+test("records and continues a typed Codex capacity rejection before the provider returns a turn ID", async () => {
+  const fixture = await createTurnRecoveryFixture({ rejectFirstStart: true });
+  try {
+    await expect(
+      fixture.manager.runAgent(fixture.agentId, "original controller prompt"),
+    ).rejects.toThrow("Selected model is at capacity");
+    const observation = await fixture.manager.observeTurn(fixture.agentId);
+    expect(observation).toMatchObject({
+      turnId: expect.stringMatching(/^paseo-start-/),
+      status: "failed",
+      error: {
+        providerCode: "server_overloaded",
+        normalizedClass: "capacity_overload",
+      },
+      effects: { state: "none_proven" },
+      complete: true,
+    });
+
+    const input = continuationInput(fixture.agentId, observation!);
+    const result = await fixture.manager.continueAfterFailure(input);
+    expect(result).toMatchObject({
+      status: "receipt",
+      receipt: {
+        turnId: observation?.turnId,
+        newTurnId: "recovery-turn-2",
+        state: "started",
+      },
+    });
+    expect(fixture.session.startCount).toBe(2);
+    expect(fixture.session.prompts).toEqual([
+      "original controller prompt",
+      "controller continuation prompt, verbatim",
+    ]);
+  } finally {
+    await fixture.manager.closeAgent(fixture.agentId).catch(() => undefined);
+    await fixture.storage.flush();
+    rmSync(fixture.workdir, { recursive: true, force: true });
+  }
+});
+
+test("refuses continuation after a tool action or truncated Codex telemetry", async () => {
+  const toolFixture = await createTurnRecoveryFixture({
+    firstTimelineItem: {
+      type: "tool_call",
+      callId: "call-write",
+      name: "exec_command",
+      status: "completed",
+      error: null,
+      detail: { type: "shell", command: "touch result.txt" },
+    },
+  });
+  try {
+    const observation = await failFirstRecoveryTurn(toolFixture.manager, toolFixture.agentId);
+    expect(observation.effects).toMatchObject({
+      state: "present",
+      toolCalls: [{ callId: "call-write", status: "completed" }],
+      shellCommands: [{ command: "touch result.txt", status: "completed" }],
+    });
+    await expect(
+      toolFixture.manager.continueAfterFailure(continuationInput(toolFixture.agentId, observation)),
+    ).resolves.toEqual({ status: "refused", reason: "effects_not_none_proven" });
+    expect(toolFixture.session.startCount).toBe(1);
+  } finally {
+    await toolFixture.manager.closeAgent(toolFixture.agentId).catch(() => undefined);
+    await toolFixture.storage.flush();
+    rmSync(toolFixture.workdir, { recursive: true, force: true });
+  }
+
+  const truncatedFixture = await createTurnRecoveryFixture({
+    firstTimelineItem: {
+      type: "tool_call",
+      callId: "call-search",
+      name: "search",
+      status: "completed",
+      error: null,
+      detail: { type: "search", query: "needle", truncated: true },
+    },
+  });
+  try {
+    const observation = await failFirstRecoveryTurn(
+      truncatedFixture.manager,
+      truncatedFixture.agentId,
+    );
+    expect(observation).toMatchObject({
+      effects: { state: "unknown", reason: "timeline_truncated" },
+      complete: false,
+      truncated: true,
+    });
+    await expect(
+      truncatedFixture.manager.continueAfterFailure(
+        continuationInput(truncatedFixture.agentId, observation),
+      ),
+    ).resolves.toEqual({ status: "refused", reason: "telemetry_incomplete" });
+    expect(truncatedFixture.session.startCount).toBe(1);
+  } finally {
+    await truncatedFixture.manager.closeAgent(truncatedFixture.agentId).catch(() => undefined);
+    await truncatedFixture.storage.flush();
+    rmSync(truncatedFixture.workdir, { recursive: true, force: true });
+  }
+
+  const unknownFixture = await createTurnRecoveryFixture();
+  try {
+    const observation = await failFirstRecoveryTurn(unknownFixture.manager, unknownFixture.agentId);
+    await unknownFixture.turnObservationStore.markTelemetryIncomplete(
+      unknownFixture.agentId,
+      observation.turnId,
+    );
+    await expect(
+      unknownFixture.manager.continueAfterFailure(
+        continuationInput(unknownFixture.agentId, observation),
+      ),
+    ).resolves.toEqual({ status: "refused", reason: "telemetry_incomplete" });
+    await expect(unknownFixture.manager.observeTurn(unknownFixture.agentId)).resolves.toMatchObject(
+      {
+        effects: { state: "unknown", reason: "telemetry_write_failed" },
+        complete: false,
+        truncated: false,
+      },
+    );
+    expect(unknownFixture.session.startCount).toBe(1);
+  } finally {
+    await unknownFixture.manager.closeAgent(unknownFixture.agentId).catch(() => undefined);
+    await unknownFixture.storage.flush();
+    rmSync(unknownFixture.workdir, { recursive: true, force: true });
+  }
+});
+
+test("refuses when the failed turn is not last, config drifted, a prompt is admitted, or archived", async () => {
+  const mismatchFixture = await createTurnRecoveryFixture();
+  try {
+    const observation = await failFirstRecoveryTurn(
+      mismatchFixture.manager,
+      mismatchFixture.agentId,
+    );
+    await mismatchFixture.manager.runAgent(mismatchFixture.agentId, "a later turn");
+    await expect(
+      mismatchFixture.manager.continueAfterFailure(
+        continuationInput(mismatchFixture.agentId, observation),
+      ),
+    ).resolves.toEqual({ status: "refused", reason: "turn_mismatch" });
+    expect(mismatchFixture.session.startCount).toBe(2);
+  } finally {
+    await mismatchFixture.manager.closeAgent(mismatchFixture.agentId).catch(() => undefined);
+    await mismatchFixture.storage.flush();
+    rmSync(mismatchFixture.workdir, { recursive: true, force: true });
+  }
+
+  const configFixture = await createTurnRecoveryFixture();
+  try {
+    const observation = await failFirstRecoveryTurn(configFixture.manager, configFixture.agentId);
+    await configFixture.manager.setAgentModel(configFixture.agentId, "gpt-5.4-mini");
+    await expect(
+      configFixture.manager.continueAfterFailure(
+        continuationInput(configFixture.agentId, observation),
+      ),
+    ).resolves.toEqual({ status: "refused", reason: "config_changed" });
+    expect(configFixture.session.startCount).toBe(1);
+  } finally {
+    await configFixture.manager.closeAgent(configFixture.agentId).catch(() => undefined);
+    await configFixture.storage.flush();
+    rmSync(configFixture.workdir, { recursive: true, force: true });
+  }
+
+  const admissionFixture = await createTurnRecoveryFixture();
+  try {
+    const observation = await failFirstRecoveryTurn(
+      admissionFixture.manager,
+      admissionFixture.agentId,
+    );
+    const release = admissionFixture.manager.beginPromptAdmission(admissionFixture.agentId);
+    try {
+      await expect(
+        admissionFixture.manager.continueAfterFailure(
+          continuationInput(admissionFixture.agentId, observation),
+        ),
+      ).resolves.toEqual({ status: "refused", reason: "queued_prompt" });
+    } finally {
+      release();
+    }
+    expect(admissionFixture.session.startCount).toBe(1);
+  } finally {
+    await admissionFixture.manager.closeAgent(admissionFixture.agentId).catch(() => undefined);
+    await admissionFixture.storage.flush();
+    rmSync(admissionFixture.workdir, { recursive: true, force: true });
+  }
+
+  const archivedFixture = await createTurnRecoveryFixture();
+  try {
+    const observation = await failFirstRecoveryTurn(
+      archivedFixture.manager,
+      archivedFixture.agentId,
+    );
+    await archivedFixture.manager.archiveAgent(archivedFixture.agentId);
+    await expect(
+      archivedFixture.manager.continueAfterFailure(
+        continuationInput(archivedFixture.agentId, observation),
+      ),
+    ).resolves.toEqual({ status: "refused", reason: "agent_archived" });
+    expect(archivedFixture.session.startCount).toBe(1);
+  } finally {
+    await archivedFixture.manager.closeAgent(archivedFixture.agentId).catch(() => undefined);
+    await archivedFixture.storage.flush();
+    rmSync(archivedFixture.workdir, { recursive: true, force: true });
+  }
+});
+
+test("refuses continuation while a turn is active", async () => {
+  const fixture = await createTurnRecoveryFixture({ holdSecondTurn: true });
+  try {
+    const observation = await failFirstRecoveryTurn(fixture.manager, fixture.agentId);
+    void drainAsyncGenerator(fixture.manager.streamAgent(fixture.agentId, "active prompt"));
+    await fixture.manager.waitForAgentRunStart(fixture.agentId);
+    await expect(
+      fixture.manager.continueAfterFailure(continuationInput(fixture.agentId, observation)),
+    ).resolves.toEqual({ status: "refused", reason: "active_turn" });
+    expect(fixture.session.startCount).toBe(2);
+  } finally {
+    await fixture.manager.closeAgent(fixture.agentId).catch(() => undefined);
+    await fixture.storage.flush();
+    rmSync(fixture.workdir, { recursive: true, force: true });
+  }
+});
+
+test("refuses continuation for a closed agent", async () => {
+  const fixture = await createTurnRecoveryFixture();
+  try {
+    const observation = await failFirstRecoveryTurn(fixture.manager, fixture.agentId);
+    await fixture.manager.closeAgent(fixture.agentId);
+    await expect(
+      fixture.manager.continueAfterFailure(continuationInput(fixture.agentId, observation)),
+    ).resolves.toEqual({ status: "refused", reason: "agent_closed" });
+    expect(fixture.session.startCount).toBe(1);
+  } finally {
+    await fixture.manager.closeAgent(fixture.agentId).catch(() => undefined);
+    await fixture.storage.flush();
+    rmSync(fixture.workdir, { recursive: true, force: true });
   }
 });
