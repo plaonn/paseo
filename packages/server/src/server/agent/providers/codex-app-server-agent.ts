@@ -5383,6 +5383,9 @@ export class CodexAppServerAgentSession implements AgentSession {
         this.handleInvalidNotificationPayload(parsed);
         return;
       case "unknown_method":
+        if (parsed.method.startsWith("item/") || parsed.method.startsWith("codex/event/")) {
+          this.markCurrentTurnObservationIncomplete();
+        }
         this.warnUnknownNotificationMethod(parsed.method, parsed.params);
         return;
       default:
@@ -6652,21 +6655,19 @@ export class CodexAppServerAgentSession implements AgentSession {
   private observeRawCodexThreadItem(item: unknown, turnId: string | null): void {
     if (codexThreadItemHasCompleteEffectMapping(item, this.config.cwd ?? null)) return;
     const observedTurnId = this.activeForegroundTurnId ?? this.currentTurnId ?? turnId ?? undefined;
-    if (!observedTurnId) return;
     this.emitEvent({
       type: "turn_observation_incomplete",
       provider: CODEX_PROVIDER,
-      turnId: observedTurnId,
+      ...(observedTurnId ? { turnId: observedTurnId } : {}),
     });
   }
 
   private markCurrentTurnObservationIncomplete(): void {
     const turnId = this.activeForegroundTurnId ?? this.currentTurnId;
-    if (!turnId) return;
     this.emitEvent({
       type: "turn_observation_incomplete",
       provider: CODEX_PROVIDER,
-      turnId,
+      ...(turnId ? { turnId } : {}),
     });
   }
 

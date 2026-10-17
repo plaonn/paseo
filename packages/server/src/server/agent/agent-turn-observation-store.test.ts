@@ -74,6 +74,83 @@ test("a schema-typed Codex capacity failure with no side effects proves none_pro
   }
 });
 
+test("orphan telemetry poisons the latest turn or the next turn after a durable unavailable marker", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "paseo-turn-orphan-telemetry-"));
+  try {
+    const store = new AgentTurnObservationStore(directory);
+    await store.startTurn({
+      agentId: "agent-with-latest",
+      turnId: "turn-latest",
+      workspaceId: "workspace-1",
+      provider: "codex",
+      config: {
+        cwd: "/workspace/project",
+        features: {},
+        model: "gpt-5-codex",
+        thinkingEffort: "high",
+        mode: "default",
+      },
+    });
+    await store.finishTurn({
+      agentId: "agent-with-latest",
+      turnId: "turn-latest",
+      status: "failed",
+      providerCode: null,
+      providerClass: "serverOverloaded",
+      rawMessage: "capacity rejection",
+    });
+    await store.recordTimelineItem("agent-with-latest", "trimmed-turn", {
+      type: "tool_call",
+      callId: "orphan-call",
+      name: "exec_command",
+      status: "completed",
+      error: null,
+      detail: { type: "shell", command: "touch side-effect.txt" },
+    });
+    await expect(store.observeTurn("agent-with-latest")).resolves.toMatchObject({
+      turnId: "turn-latest",
+      complete: false,
+      effects: { state: "unknown", reason: "telemetry_incomplete" },
+    });
+
+    await store.recordMessageDelivery("agent-without-latest", undefined, {
+      callId: "orphan-delivery",
+      name: "agent_prompt",
+      status: "completed",
+    });
+
+    const reloadedStore = new AgentTurnObservationStore(directory);
+    await reloadedStore.startTurn({
+      agentId: "agent-without-latest",
+      turnId: "turn-after-orphan",
+      workspaceId: "workspace-1",
+      provider: "codex",
+      config: {
+        cwd: "/workspace/project",
+        features: {},
+        model: "gpt-5-codex",
+        thinkingEffort: "high",
+        mode: "default",
+      },
+    });
+    await reloadedStore.finishTurn({
+      agentId: "agent-without-latest",
+      turnId: "turn-after-orphan",
+      status: "failed",
+      providerCode: null,
+      providerClass: "serverOverloaded",
+      rawMessage: "capacity rejection",
+    });
+    await expect(reloadedStore.observeTurn("agent-without-latest")).resolves.toMatchObject({
+      turnId: "turn-after-orphan",
+      complete: false,
+      effects: { state: "unknown", reason: "telemetry_incomplete" },
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("a tool call makes effects present, while unsupported providers remain unknown", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "paseo-turn-observation-"));
   try {

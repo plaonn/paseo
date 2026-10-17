@@ -4743,8 +4743,7 @@ export class AgentManager {
 
   private async markLatestTurnObservationIncomplete(agentId: string): Promise<void> {
     try {
-      const last = await this.turnObservationStore?.observeTurn(agentId);
-      if (last) await this.markTurnObservationIncomplete(agentId, last.turnId);
+      await this.turnObservationStore?.markTelemetryIncomplete(agentId);
     } catch (error) {
       this.turnObservationUnavailable.add(agentId);
       this.logger.error(

@@ -3532,6 +3532,31 @@ describe("Codex app-server provider", () => {
     });
   });
 
+  test("marks unknown item and legacy Codex event methods as incomplete", () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    asInternals(session).handleNotification("item/futureToolAction", { item: {} });
+    asInternals(session).currentTurnId = null;
+    asInternals(session).activeForegroundTurnId = null;
+    asInternals(session).handleNotification("codex/event/exec_command_begin_future", {
+      msg: { type: "exec_command_begin_future" },
+    });
+
+    expect(events).toEqual([
+      {
+        type: "turn_observation_incomplete",
+        provider: "codex",
+        turnId: "test-turn",
+      },
+      {
+        type: "turn_observation_incomplete",
+        provider: "codex",
+      },
+    ]);
+  });
+
   test("routes msg-scoped legacy Codex events to their child thread", () => {
     const session = createSession();
     const events: AgentStreamEvent[] = [];
@@ -5465,6 +5490,11 @@ describe("Codex app-server provider", () => {
 
     expect(events).toEqual([
       {
+        type: "turn_observation_incomplete",
+        provider: "codex",
+        turnId: "test-turn",
+      },
+      {
         type: "timeline",
         provider: "codex",
         turnId: "test-turn",
@@ -5497,6 +5527,11 @@ describe("Codex app-server provider", () => {
 
       expect(events).toEqual([
         {
+          type: "turn_observation_incomplete",
+          provider: "codex",
+          turnId: "test-turn",
+        },
+        {
           type: "timeline",
           provider: "codex",
           turnId: "test-turn",
@@ -5523,8 +5558,13 @@ describe("Codex app-server provider", () => {
       },
     });
 
-    expect(events).toHaveLength(1);
-    const event = events[0];
+    expect(events).toHaveLength(2);
+    expect(events[0]).toEqual({
+      type: "turn_observation_incomplete",
+      provider: "codex",
+      turnId: "test-turn",
+    });
+    const event = events[1];
     expect(event).toMatchObject({
       type: "timeline",
       provider: "codex",
@@ -5681,6 +5721,11 @@ describe("Codex app-server provider", () => {
     });
 
     expect(events).toEqual([
+      {
+        type: "turn_observation_incomplete",
+        provider: "codex",
+        turnId: "test-turn",
+      },
       {
         type: "turn_completed",
         provider: "codex",

@@ -252,7 +252,9 @@ paseo agent continue-after-failure <id> \
 `provider`, `workspaceId`, `cwd`, model, thinking effort, mode, `configDigest`,
 `configComplete`, timestamps, `error`, `effects`, `complete`, and `truncated`.
 The digest covers agent ID, workspace ID, provider, cwd, provider feature
-values, model, thinking effort, and mode used by the turn. A missing or
+values known to Paseo, model, thinking effort, and mode used by the turn.
+Provider-side feature changes made outside `setAgentFeature` are outside this
+digest and cannot be detected by this check. A missing or
 unreadable turn has `status: "unknown"`,
 `complete: false`, and `effects.state: "unknown"`. Turns without a persisted
 observation, including turns from before this feature was enabled, are
@@ -301,8 +303,8 @@ value; it does not infer overload from message text or remaining allowance.
 For a `turn/start` JSON-RPC rejection, Paseo retains the numeric RPC code and
 raw `data`, and reads `data.codexErrorInfo` only when that typed field is
 present. The local schema does not assign overload meaning to a numeric
-JSON-RPC code, and this contract has not been confirmed against a live
-provider payload.
+JSON-RPC code. The `turn/start` rejection shape is an assumption test; confirm
+it against a live provider payload before relying on `turn/start` rejections.
 
 For Codex, `none_proven` is limited to turns whose raw ThreadItem timeline was
 fully received and whose items are covered by the explicit effect mapping.
@@ -321,8 +323,12 @@ When `effects.state` is `present`, the object contains `toolCalls` entries with
 `completed`, `failed`, or `canceled`. For `effects.state: "unknown"`, the same
 partial manifest is under `observed`, with a `reason`. A prompt steered into
 an active turn is recorded as an `agent_prompt` message delivery. The
-`assistantResponses` compatibility field remains zero; `agentMessage` does not
-count as an effect.
+`assistantResponses` compatibility field is deprecated and informational; it
+remains zero. Effects count tool calls and their file or shell actions,
+message deliveries, and subagent spawns. User prompts, reasoning, plans,
+context compaction, and assistant text by themselves do not count as external
+effects. Image view and image generation items are not in the no-effect
+allowlist; their telemetry is unknown, so they cannot authorize continuation.
 
 `continue-after-failure` requires the exact failed last turn ID, its config
 digest, an idempotency key, and exactly one caller-supplied prompt (`--prompt`

@@ -38,6 +38,7 @@ const EffectManifestSchema = z.object({
   shellCommands: z.array(ShellCommandEffectSchema),
   messageDeliveries: z.array(MessageDeliveryEffectSchema),
   subAgentSpawns: z.array(SubAgentSpawnEffectSchema),
+  // Deprecated informational compatibility field. It remains zero.
   assistantResponses: z.number().int().nonnegative(),
 });
 const EffectsSchema = z.discriminatedUnion("state", [
@@ -82,6 +83,7 @@ const JournalSchema = z.object({
   version: z.literal(1),
   nextOrder: z.number().int().nonnegative(),
   turns: z.array(TurnObservationSchema),
+  turnObservationUnavailable: z.boolean().optional(),
 });
 
 const ReceiptSchema = z.object({
@@ -111,6 +113,7 @@ export type AgentTurnEffects = z.infer<typeof EffectsSchema>;
 export type AgentTurnEffectManifest = z.infer<typeof EffectManifestSchema>;
 export type AgentTurnProviderError = z.infer<typeof ProviderErrorSchema>;
 export type AgentTurnContinuationReceipt = z.infer<typeof ReceiptSchema>;
+type AgentTurnJournal = z.infer<typeof JournalSchema>;
 
 export interface AgentTurnConfigSnapshot {
   model: string | null;
@@ -251,6 +254,26 @@ function hasEffects(manifest: AgentTurnEffectManifest): boolean {
   );
 }
 
+function markObservationTelemetryIncomplete(observation: AgentTurnObservation): void {
+  observation.telemetryFailed = true;
+  observation.complete = false;
+  observation.effects = {
+    state: "unknown",
+    reason: "telemetry_incomplete",
+    observed: manifestFromEffects(observation.effects),
+  };
+}
+
+function poisonLatestObservation(journal: AgentTurnJournal): AgentTurnObservation | null {
+  const latest = journal.turns.at(-1);
+  if (!latest) {
+    journal.turnObservationUnavailable = true;
+    return null;
+  }
+  markObservationTelemetryIncomplete(latest);
+  return latest;
+}
+
 function observeEffects(
   observation: AgentTurnObservation,
   manifest: AgentTurnEffectManifest,
@@ -367,6 +390,8 @@ export class AgentTurnObservationStore {
       const journal = await this.readJournal(input.agentId);
       const existing = journal.turns.find((turn) => turn.turnId === input.turnId);
       if (existing) return;
+      const priorTelemetryUnavailable = journal.turnObservationUnavailable === true;
+      if (priorTelemetryUnavailable) delete journal.turnObservationUnavailable;
       const startedAt = input.startedAt ?? new Date().toISOString();
       const config = {
         agentId: input.agentId,
@@ -403,12 +428,12 @@ export class AgentTurnObservationStore {
         error: null,
         effects: {
           state: "unknown",
-          reason: "turn_in_progress",
+          reason: priorTelemetryUnavailable ? "telemetry_incomplete" : "turn_in_progress",
           observed: emptyManifest(),
         },
         complete: false,
         truncated: false,
-        telemetryFailed: false,
+        telemetryFailed: priorTelemetryUnavailable,
       };
       journal.nextOrder += 1;
       journal.turns.push(observation);
@@ -421,13 +446,17 @@ export class AgentTurnObservationStore {
 
   async recordTimelineItem(
     agentId: string,
-    turnId: string,
+    turnId: string | undefined,
     item: AgentTimelineItem,
   ): Promise<void> {
     await this.withAgentLock(agentId, async () => {
       const journal = await this.readJournal(agentId);
-      const observation = journal.turns.find((turn) => turn.turnId === turnId);
-      if (!observation) return;
+      const observation = turnId ? journal.turns.find((turn) => turn.turnId === turnId) : undefined;
+      if (!observation) {
+        poisonLatestObservation(journal);
+        await this.writeJournal(agentId, journal);
+        return;
+      }
       if (observation.provider !== "codex") return;
       applyTimelineItem(observation, item);
       if (observation.telemetryFailed) {
@@ -443,18 +472,20 @@ export class AgentTurnObservationStore {
     });
   }
 
-  async markTelemetryIncomplete(agentId: string, turnId: string): Promise<void> {
+  async markTelemetryIncomplete(agentId: string, turnId?: string): Promise<void> {
     await this.withAgentLock(agentId, async () => {
       const journal = await this.readJournal(agentId);
-      const observation = journal.turns.find((turn) => turn.turnId === turnId);
-      if (!observation) return;
-      observation.telemetryFailed = true;
-      observation.complete = false;
-      observation.effects = {
-        state: "unknown",
-        reason: "telemetry_incomplete",
-        observed: manifestFromEffects(observation.effects),
-      };
+      const observation = turnId ? journal.turns.find((turn) => turn.turnId === turnId) : undefined;
+      const poisoned = observation ?? poisonLatestObservation(journal);
+      if (!poisoned) {
+        await this.writeJournal(agentId, journal);
+        return;
+      }
+      if (!observation) {
+        await this.writeJournal(agentId, journal);
+        return;
+      }
+      markObservationTelemetryIncomplete(observation);
       if (observation.status === "running") this.scheduleJournalWrite(agentId);
       else await this.writeJournal(agentId, journal);
     });
@@ -462,14 +493,18 @@ export class AgentTurnObservationStore {
 
   async recordSubAgentSpawn(
     agentId: string,
-    turnId: string,
+    turnId: string | undefined,
     subAgentId: string,
     status: "running" | "completed" | "failed" | "canceled" = "running",
   ): Promise<void> {
     await this.withAgentLock(agentId, async () => {
       const journal = await this.readJournal(agentId);
-      const observation = journal.turns.find((turn) => turn.turnId === turnId);
-      if (!observation) return;
+      const observation = turnId ? journal.turns.find((turn) => turn.turnId === turnId) : undefined;
+      if (!observation) {
+        poisonLatestObservation(journal);
+        await this.writeJournal(agentId, journal);
+        return;
+      }
       if (observation.provider !== "codex") return;
       const manifest = manifestFromEffects(observation.effects);
       const existingIndex = manifest.subAgentSpawns.findIndex((entry) => entry.id === subAgentId);
@@ -513,14 +548,19 @@ export class AgentTurnObservationStore {
               };
         changed = true;
       }
-      if (changed) await this.writeJournal(agentId, journal);
+      if (changed) {
+        await this.writeJournal(agentId, journal);
+      } else {
+        poisonLatestObservation(journal);
+        await this.writeJournal(agentId, journal);
+      }
       return changed;
     });
   }
 
   async recordMessageDelivery(
     agentId: string,
-    turnId: string,
+    turnId: string | undefined,
     delivery: {
       callId: string;
       name: string;
@@ -529,8 +569,12 @@ export class AgentTurnObservationStore {
   ): Promise<void> {
     await this.withAgentLock(agentId, async () => {
       const journal = await this.readJournal(agentId);
-      const observation = journal.turns.find((turn) => turn.turnId === turnId);
-      if (!observation) return;
+      const observation = turnId ? journal.turns.find((turn) => turn.turnId === turnId) : undefined;
+      if (!observation) {
+        poisonLatestObservation(journal);
+        await this.writeJournal(agentId, journal);
+        return;
+      }
       if (observation.provider !== "codex") return;
       const manifest = manifestFromEffects(observation.effects);
       upsertById(manifest.messageDeliveries, delivery);
@@ -550,7 +594,11 @@ export class AgentTurnObservationStore {
     await this.withAgentLock(input.agentId, async () => {
       const journal = await this.readJournal(input.agentId);
       const observation = journal.turns.find((turn) => turn.turnId === input.turnId);
-      if (!observation) return;
+      if (!observation) {
+        poisonLatestObservation(journal);
+        await this.writeJournal(input.agentId, journal);
+        return;
+      }
       observation.telemetryFailed =
         observation.telemetryFailed || input.telemetryIncomplete === true;
       observation.status = input.status;

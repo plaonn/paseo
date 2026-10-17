@@ -4653,7 +4653,13 @@ const AgentTurnEffectManifestPayloadSchema = z.object({
       status: z.enum(["running", "completed", "failed", "canceled"]),
     }),
   ),
-  assistantResponses: z.number().int().nonnegative(),
+  assistantResponses: z
+    .number()
+    .int()
+    .nonnegative()
+    .describe(
+      "Deprecated informational compatibility field. Always zero; assistant text is not an external effect.",
+    ),
 });
 
 export const AgentTurnEffectsPayloadSchema = z.discriminatedUnion("state", [

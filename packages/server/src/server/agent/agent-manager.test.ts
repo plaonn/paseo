@@ -11238,7 +11238,32 @@ test("continues a proven no-effect capacity failure once on the same provider se
   }
 });
 
-test("records and continues a typed Codex capacity rejection before the provider returns a turn ID", async () => {
+test("assistant-only partial text remains effect-free and can continue after overload", async () => {
+  const fixture = await createTurnRecoveryFixture({
+    firstTimelineItem: { type: "assistant_message", text: "Partial answer before overload." },
+  });
+  try {
+    const observation = await failFirstRecoveryTurn(fixture.manager, fixture.agentId);
+    expect(observation).toMatchObject({
+      status: "failed",
+      error: { normalizedClass: "capacity_overload" },
+      effects: { state: "none_proven" },
+      complete: true,
+    });
+
+    const result = await fixture.manager.continueAfterFailure(
+      continuationInput(fixture.agentId, observation),
+    );
+    expect(result).toMatchObject({ status: "receipt", receipt: { state: "started" } });
+    expect(fixture.session.startCount).toBe(2);
+  } finally {
+    await fixture.manager.closeAgent(fixture.agentId).catch(() => undefined);
+    await fixture.storage.flush();
+    rmSync(fixture.workdir, { recursive: true, force: true });
+  }
+});
+
+test("assumption test: records typed turn-start overload data before the provider returns a turn ID", async () => {
   const fixture = await createTurnRecoveryFixture({ rejectFirstStart: true });
   try {
     await expect(
@@ -11307,7 +11332,7 @@ test("does not infer overload from a JSON-RPC number or message text alone", asy
   }
 });
 
-test("refuses continuation after a tool action or truncated Codex telemetry", async () => {
+test("refuses after a tool call then overload or truncated Codex telemetry", async () => {
   const toolFixture = await createTurnRecoveryFixture({
     firstTimelineItem: {
       type: "tool_call",
@@ -11391,6 +11416,27 @@ test("refuses continuation after a tool action or truncated Codex telemetry", as
     await unknownFixture.manager.closeAgent(unknownFixture.agentId).catch(() => undefined);
     await unknownFixture.storage.flush();
     rmSync(unknownFixture.workdir, { recursive: true, force: true });
+  }
+});
+
+test("refuses continuation when incomplete telemetry has no turn ID", async () => {
+  const fixture = await createTurnRecoveryFixture();
+  try {
+    const observation = await failFirstRecoveryTurn(fixture.manager, fixture.agentId);
+    await fixture.turnObservationStore.markTelemetryIncomplete(fixture.agentId);
+
+    await expect(fixture.manager.observeTurn(fixture.agentId)).resolves.toMatchObject({
+      complete: false,
+      effects: { state: "unknown", reason: "telemetry_incomplete" },
+    });
+    await expect(
+      fixture.manager.continueAfterFailure(continuationInput(fixture.agentId, observation)),
+    ).resolves.toEqual({ status: "refused", reason: "telemetry_incomplete" });
+    expect(fixture.session.startCount).toBe(1);
+  } finally {
+    await fixture.manager.closeAgent(fixture.agentId).catch(() => undefined);
+    await fixture.storage.flush();
+    rmSync(fixture.workdir, { recursive: true, force: true });
   }
 });
 
