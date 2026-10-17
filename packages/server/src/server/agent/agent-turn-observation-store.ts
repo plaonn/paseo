@@ -530,11 +530,14 @@ export class AgentTurnObservationStore {
     return this.withAgentLock(agentId, async () => {
       const journal = await this.readJournal(agentId);
       let changed = false;
+      let found = false;
       for (const observation of journal.turns) {
         if (observation.provider !== "codex") continue;
         const manifest = manifestFromEffects(observation.effects);
         const subAgent = manifest.subAgentSpawns.find((entry) => entry.id === subAgentId);
-        if (!subAgent || subAgent.status === status) continue;
+        if (!subAgent) continue;
+        found = true;
+        if (subAgent.status === status) continue;
         subAgent.status = status;
         observation.effects =
           observation.provider === "codex" && !observation.telemetryFailed
@@ -550,7 +553,7 @@ export class AgentTurnObservationStore {
       }
       if (changed) {
         await this.writeJournal(agentId, journal);
-      } else {
+      } else if (!found) {
         poisonLatestObservation(journal);
         await this.writeJournal(agentId, journal);
       }

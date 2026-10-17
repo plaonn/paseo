@@ -315,6 +315,21 @@ ThreadItem type, malformed tool item, or unreadable/truncated timeline makes
 the manifest unknown. Other providers return `effects.state: "unknown"` and
 cannot pass continuation checks.
 
+Codex notifications also affect completeness. These bundled v2 schema methods
+are treated as output-only stream or accounting updates: `item/agentMessage/delta`,
+`item/commandExecution/outputDelta`, `item/fileChange/outputDelta`,
+`item/mcpToolCall/progress`, `item/plan/delta`,
+`item/reasoning/summaryPartAdded`, `item/reasoning/summaryTextDelta`,
+`item/reasoning/textDelta`, and `turn/plan/updated`. The legacy event stream
+allows `token_count`, `task_started`, `agent_message_delta`, and the
+`mcp_startup_*` family. Other unknown `item/*` and `codex/event/*` methods,
+including action lifecycle and approval notifications, make effects unknown.
+Unknown `hook/started`, `hook/completed`, `fs/changed`, strict-review approval,
+MCP event-stream, server-request resolution, and turn-diff notifications also
+make effects unknown.
+These method names are derived from the bundled schema and local legacy event
+handling; Paseo has not confirmed which ones a live Codex session emits.
+
 When `effects.state` is `present`, the object contains `toolCalls` entries with
 `callId`, `name`, and `status`; `fileWrites` entries with `callId`, `path`, and
 `status`; `shellCommands` entries with `callId`, `command`, and `status`;

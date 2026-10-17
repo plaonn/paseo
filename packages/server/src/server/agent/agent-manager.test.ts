@@ -11038,8 +11038,10 @@ class TurnRecoverySession extends TestAgentSession {
     config: AgentSessionConfig,
     private readonly options: {
       firstTimelineItem?: AgentTimelineItem;
+      firstSubAgentStatus?: "running" | "completed" | "failed" | "canceled";
       holdSecondTurn?: boolean;
       holdSecondStart?: boolean;
+      failEveryTurn?: boolean;
       rejectFirstStart?: boolean;
       rejectFirstStartWithoutTypedInfo?: boolean;
     } = {},
@@ -11074,6 +11076,18 @@ class TurnRecoverySession extends TestAgentSession {
     }
     setTimeout(() => {
       this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+      if (count === 1 && this.options.firstSubAgentStatus) {
+        this.pushEvent({
+          type: "provider_subagent",
+          provider: this.provider,
+          event: {
+            type: "upsert",
+            id: "recovery-subagent",
+            title: "Recovery subagent",
+            status: this.options.firstSubAgentStatus,
+          },
+        });
+      }
       if (count === 1) {
         if (this.options.firstTimelineItem) {
           this.pushEvent({
@@ -11083,6 +11097,20 @@ class TurnRecoverySession extends TestAgentSession {
             item: this.options.firstTimelineItem,
           });
         }
+        this.pushEvent({
+          type: "turn_failed",
+          provider: this.provider,
+          turnId,
+          error: "Selected model is at capacity. Please try a different model.",
+          providerClass: "serverOverloaded",
+          providerRawValue: {
+            message: "Selected model is at capacity. Please try a different model.",
+            codexErrorInfo: "serverOverloaded",
+          },
+        });
+        return;
+      }
+      if (this.options.failEveryTurn) {
         this.pushEvent({
           type: "turn_failed",
           provider: this.provider,
@@ -11119,8 +11147,10 @@ class TurnRecoverySession extends TestAgentSession {
 
 async function createTurnRecoveryFixture(options?: {
   firstTimelineItem?: AgentTimelineItem;
+  firstSubAgentStatus?: "running" | "completed" | "failed" | "canceled";
   holdSecondTurn?: boolean;
   holdSecondStart?: boolean;
+  failEveryTurn?: boolean;
   rejectFirstStart?: boolean;
   rejectFirstStartWithoutTypedInfo?: boolean;
 }): Promise<{
@@ -11256,6 +11286,84 @@ test("assistant-only partial text remains effect-free and can continue after ove
     );
     expect(result).toMatchObject({ status: "receipt", receipt: { state: "started" } });
     expect(fixture.session.startCount).toBe(2);
+  } finally {
+    await fixture.manager.closeAgent(fixture.agentId).catch(() => undefined);
+    await fixture.storage.flush();
+    rmSync(fixture.workdir, { recursive: true, force: true });
+  }
+});
+
+test("a transient observation write failure is reconciled after a later successful write", async () => {
+  const fixture = await createTurnRecoveryFixture({ failEveryTurn: true });
+  try {
+    const firstObservation = await failFirstRecoveryTurn(fixture.manager, fixture.agentId);
+    const markerSpy = vi
+      .spyOn(fixture.turnObservationStore, "markTelemetryIncomplete")
+      .mockRejectedValue(new Error("simulated transient journal write failure"));
+    fixture.session.pushEvent({
+      type: "turn_observation_incomplete",
+      provider: "codex",
+      turnId: firstObservation.turnId,
+    });
+    await fixture.manager.flush();
+    markerSpy.mockRestore();
+
+    await expect(fixture.manager.runAgent(fixture.agentId, "second caller prompt")).rejects.toThrow(
+      "Selected model is at capacity",
+    );
+    await expect(fixture.manager.runAgent(fixture.agentId, "third caller prompt")).rejects.toThrow(
+      "Selected model is at capacity",
+    );
+    const thirdObservation = await fixture.manager.observeTurn(fixture.agentId);
+    expect(thirdObservation).toMatchObject({
+      turnId: "recovery-turn-3",
+      status: "failed",
+      effects: { state: "none_proven" },
+      complete: true,
+    });
+    await expect(
+      fixture.manager.continueAfterFailure(continuationInput(fixture.agentId, thirdObservation!)),
+    ).resolves.toMatchObject({ status: "receipt", receipt: { state: "started" } });
+    expect(fixture.session.startCount).toBe(4);
+  } finally {
+    await fixture.manager.closeAgent(fixture.agentId).catch(() => undefined);
+    await fixture.storage.flush();
+    rmSync(fixture.workdir, { recursive: true, force: true });
+  }
+});
+
+test("repeated no-change subagent status does not poison the latest turn", async () => {
+  const fixture = await createTurnRecoveryFixture({ firstSubAgentStatus: "completed" });
+  try {
+    const observation = await failFirstRecoveryTurn(fixture.manager, fixture.agentId);
+    expect(observation).toMatchObject({
+      effects: {
+        state: "present",
+        subAgentSpawns: [{ id: "recovery-subagent", status: "completed" }],
+      },
+      complete: true,
+    });
+
+    fixture.session.pushEvent({
+      type: "provider_subagent",
+      provider: "codex",
+      event: {
+        type: "upsert",
+        id: "recovery-subagent",
+        title: "Recovery subagent",
+        status: "completed",
+      },
+    });
+    await fixture.manager.flush();
+
+    await expect(fixture.manager.observeTurn(fixture.agentId)).resolves.toMatchObject({
+      turnId: observation.turnId,
+      effects: {
+        state: "present",
+        subAgentSpawns: [{ id: "recovery-subagent", status: "completed" }],
+      },
+      complete: true,
+    });
   } finally {
     await fixture.manager.closeAgent(fixture.agentId).catch(() => undefined);
     await fixture.storage.flush();

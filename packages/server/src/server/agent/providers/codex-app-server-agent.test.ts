@@ -3557,6 +3557,91 @@ describe("Codex app-server provider", () => {
     ]);
   });
 
+  test("allows schema-listed stream telemetry before a typed overload", () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    for (const method of [
+      "item/commandExecution/outputDelta",
+      "item/reasoning/textDelta",
+      "item/reasoning/summaryPartAdded",
+      "item/plan/delta",
+      "item/mcpToolCall/progress",
+    ]) {
+      asInternals(session).handleNotification(method, {
+        threadId: "test-thread",
+        turnId: "test-turn",
+        itemId: "stream-item",
+        delta: "stream update",
+      });
+    }
+    asInternals(session).handleNotification("item/agentMessage/delta", {
+      threadId: "test-thread",
+      turnId: "test-turn",
+      itemId: "assistant-message",
+      delta: "partial assistant output",
+    });
+    asInternals(session).handleNotification("turn/plan/updated", {
+      threadId: "test-thread",
+      plan: [{ step: "Inspect the request", status: "inProgress" }],
+    });
+    for (const eventType of [
+      "token_count",
+      "task_started",
+      "agent_message_delta",
+      "mcp_startup_started",
+      "mcp_startup_completed",
+    ]) {
+      asInternals(session).handleNotification(`codex/event/${eventType}`, {
+        msg: { type: eventType, thread_id: "test-thread" },
+      });
+    }
+
+    asInternals(session).handleNotification("turn/completed", {
+      threadId: "test-thread",
+      turn: {
+        status: "failed",
+        error: {
+          message: "Selected model is at capacity. Please try a different model.",
+          additionalDetails: null,
+          codexErrorInfo: "serverOverloaded",
+          misalignment: null,
+        },
+      },
+    });
+
+    expect(events.some((event) => event.type === "turn_observation_incomplete")).toBe(false);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "turn_failed",
+        providerClass: "serverOverloaded",
+      }),
+    );
+  });
+
+  test("poisons unknown and approval or action notifications outside the raw item path", () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    asInternals(session).handleNotification("item/futureAction", { item: {} });
+    asInternals(session).handleNotification("codex/event/future_action", {
+      msg: { type: "future_action" },
+    });
+    asInternals(session).handleNotification("item/autoApprovalReview/started", {
+      itemId: "approval-1",
+    });
+    asInternals(session).handleNotification("item/fileChange/patchUpdated", {
+      itemId: "file-change-1",
+    });
+    asInternals(session).handleNotification("hook/started", {
+      hookId: "hook-1",
+    });
+
+    expect(events.filter((event) => event.type === "turn_observation_incomplete")).toHaveLength(5);
+  });
+
   test("routes msg-scoped legacy Codex events to their child thread", () => {
     const session = createSession();
     const events: AgentStreamEvent[] = [];

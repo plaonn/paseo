@@ -74,6 +74,49 @@ test("a schema-typed Codex capacity failure with no side effects proves none_pro
   }
 });
 
+test("a repeated subagent status is a no-op and keeps the observed effects complete", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "paseo-turn-subagent-noop-"));
+  try {
+    const store = new AgentTurnObservationStore(directory);
+    await store.startTurn({
+      agentId: "agent-1",
+      turnId: "turn-1",
+      workspaceId: "workspace-1",
+      provider: "codex",
+      config: {
+        cwd: "/workspace/project",
+        features: {},
+        model: "gpt-5-codex",
+        thinkingEffort: "high",
+        mode: "default",
+      },
+    });
+    await store.recordSubAgentSpawn("agent-1", "turn-1", "child-1", "completed");
+    await store.finishTurn({
+      agentId: "agent-1",
+      turnId: "turn-1",
+      status: "failed",
+      providerCode: null,
+      providerClass: "serverOverloaded",
+      rawMessage: "capacity rejection",
+    });
+
+    await expect(store.updateSubAgentStatus("agent-1", "child-1", "completed")).resolves.toBe(
+      false,
+    );
+    await expect(store.observeTurn("agent-1")).resolves.toMatchObject({
+      status: "failed",
+      effects: {
+        state: "present",
+        subAgentSpawns: [{ id: "child-1", status: "completed" }],
+      },
+      complete: true,
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("orphan telemetry poisons the latest turn or the next turn after a durable unavailable marker", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "paseo-turn-orphan-telemetry-"));
   try {

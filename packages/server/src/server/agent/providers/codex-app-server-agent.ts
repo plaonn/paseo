@@ -167,6 +167,55 @@ const CODEX_KNOWN_NO_EFFECT_THREAD_ITEM_TYPES = new Set([
   "contextCompaction",
   "agentMessage",
 ]);
+// Generated from the bundled Codex v2 ServerNotification schema. These methods carry
+// output-only stream or accounting updates; they cannot start or describe an external
+// action. Unknown item/* and codex/event/* methods remain effect-sensitive by default.
+const CODEX_STREAM_ONLY_NOTIFICATION_METHODS = new Set([
+  "item/agentMessage/delta",
+  "item/commandExecution/outputDelta",
+  "item/fileChange/outputDelta",
+  "item/mcpToolCall/progress",
+  "item/plan/delta",
+  "item/reasoning/summaryPartAdded",
+  "item/reasoning/summaryTextDelta",
+  "item/reasoning/textDelta",
+  "turn/plan/updated",
+]);
+// The legacy codex/event mirror is not described by the v2 schema. These exact event
+// names are stream/accounting telemetry; lifecycle, approval, and action names stay
+// effect-sensitive (including exec_command_*, patch_apply_*, mcp_tool_call_*, and
+// web_search_* events). The startup prefix is limited to the provider's startup status
+// family; every other unknown legacy event poisons the turn.
+const CODEX_STREAM_ONLY_LEGACY_EVENT_TYPES = new Set([
+  "agent_message_delta",
+  "task_started",
+  "token_count",
+]);
+// These schema notifications can describe an action, an approval boundary, or a
+// filesystem change even though they are outside the item/* and legacy namespaces.
+const CODEX_EFFECT_SENSITIVE_NOTIFICATION_METHODS = new Set([
+  "autoApprovalReview/strictReviewRequired",
+  "fs/changed",
+  "hook/completed",
+  "hook/started",
+  "mcpServer/event/stream/notification",
+  "serverRequest/resolved",
+  "turn/diff/updated",
+]);
+
+function codexUnknownNotificationMayHideEffect(method: string): boolean {
+  if (CODEX_STREAM_ONLY_NOTIFICATION_METHODS.has(method)) return false;
+  if (method.startsWith("item/")) return true;
+  if (!method.startsWith("codex/event/")) {
+    return CODEX_EFFECT_SENSITIVE_NOTIFICATION_METHODS.has(method);
+  }
+
+  const legacyEventType = method.slice("codex/event/".length);
+  return (
+    !CODEX_STREAM_ONLY_LEGACY_EVENT_TYPES.has(legacyEventType) &&
+    !/^mcp_startup_[a-z0-9_]+$/u.test(legacyEventType)
+  );
+}
 const CODEX_CONTEXT_COMPACTION_TYPE = "contextCompaction";
 const CODEX_PLAN_IMPLEMENTATION_PROMPT_PREFIX =
   "The user approved the plan. Implement it now. Do not restate or revise the plan unless blocked.";
@@ -5383,7 +5432,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         this.handleInvalidNotificationPayload(parsed);
         return;
       case "unknown_method":
-        if (parsed.method.startsWith("item/") || parsed.method.startsWith("codex/event/")) {
+        if (codexUnknownNotificationMayHideEffect(parsed.method)) {
           this.markCurrentTurnObservationIncomplete();
         }
         this.warnUnknownNotificationMethod(parsed.method, parsed.params);
@@ -5443,10 +5492,8 @@ export class CodexAppServerAgentSession implements AgentSession {
     parsed: Extract<ParsedCodexNotification, { kind: "invalid_payload" }>,
   ): void {
     if (
-      parsed.method.startsWith("item/") ||
-      parsed.method === "codex/event/item_started" ||
-      parsed.method === "codex/event/item_completed" ||
-      parsed.method === "turn/completed"
+      parsed.method === "turn/completed" ||
+      codexUnknownNotificationMayHideEffect(parsed.method)
     ) {
       this.markCurrentTurnObservationIncomplete();
     }

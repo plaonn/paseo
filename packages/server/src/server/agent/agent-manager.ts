@@ -788,6 +788,7 @@ export class AgentManager {
   private readonly configMutationCounts = new Map<string, number>();
   private readonly turnObservationFailures = new Map<string, Set<string>>();
   private readonly turnObservationUnavailable = new Set<string>();
+  private readonly turnObservationUnavailableGeneration = new Map<string, number>();
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
   private readonly mcpAuthToken: string | null;
@@ -1044,6 +1045,7 @@ export class AgentManager {
         name: "agent_prompt",
         status: "completed",
       });
+      await this.reconcileTurnObservationUnavailableAfterWrite(agentId);
     } catch (error) {
       await this.markTurnObservationIncomplete(agentId, turnId);
       this.logger.error(
@@ -2827,8 +2829,9 @@ export class AgentManager {
       if (!isTypedCapacityRejection(agent.provider, providerClass)) {
         await store.markTelemetryIncomplete(agentId, turnId);
       }
+      await this.reconcileTurnObservationUnavailableAfterWrite(agentId);
     } catch (observationError) {
-      this.turnObservationUnavailable.add(agentId);
+      this.markTurnObservationUnavailable(agentId);
       await this.markLatestTurnObservationIncomplete(agentId);
       this.logger.error(
         { err: observationError, agentId, turnId },
@@ -3018,8 +3021,9 @@ export class AgentManager {
         config: agentTurnConfig(agent),
         startedAt: startedAt.toISOString(),
       });
+      await this.reconcileTurnObservationUnavailableAfterWrite(agent.id);
     } catch (error) {
-      this.turnObservationUnavailable.add(agent.id);
+      this.markTurnObservationUnavailable(agent.id);
       this.logger.error(
         { err: error, agentId: agent.id, turnId },
         "Failed to persist agent turn observation start",
@@ -4252,6 +4256,7 @@ export class AgentManager {
           event.id,
           event.status ?? existing?.status ?? "running",
         );
+        await this.reconcileTurnObservationUnavailableAfterWrite(agent.id);
       } catch (error) {
         await this.markTurnObservationIncomplete(agent.id, activeTurnId);
         this.logger.error(
@@ -4272,7 +4277,7 @@ export class AgentManager {
         event.id,
         event.status,
       );
-      if (!updated) await this.markLatestTurnObservationIncomplete(agent.id);
+      if (updated) await this.reconcileTurnObservationUnavailableAfterWrite(agent.id);
     } catch (error) {
       await this.markLatestTurnObservationIncomplete(agent.id);
       this.logger.error(
@@ -4611,6 +4616,7 @@ export class AgentManager {
     try {
       if (event.type === "turn_observation_incomplete") {
         await store.markTelemetryIncomplete(agent.id, turnId);
+        await this.reconcileTurnObservationUnavailableAfterWrite(agent.id);
         return;
       }
       if (event.type === "timeline") {
@@ -4633,6 +4639,7 @@ export class AgentManager {
         telemetryIncomplete: this.hasTurnObservationFailure(agent.id, turnId),
       });
       this.clearTurnObservationFailure(agent.id, turnId);
+      await this.reconcileTurnObservationUnavailableAfterWrite(agent.id);
     } catch (error) {
       await this.markTurnObservationIncomplete(agent.id, turnId);
       this.logger.error(
@@ -4735,22 +4742,64 @@ export class AgentManager {
     failedTurns.add(turnId);
     try {
       await this.turnObservationStore?.markTelemetryIncomplete(agentId, turnId);
+      await this.reconcileTurnObservationUnavailableAfterWrite(agentId);
     } catch {
       // The local marker is checked when a later terminal event is persisted.
-      this.turnObservationUnavailable.add(agentId);
+      this.markTurnObservationUnavailable(agentId);
     }
   }
 
   private async markLatestTurnObservationIncomplete(agentId: string): Promise<void> {
+    const store = this.turnObservationStore;
+    if (!store) return;
+    const generation = this.turnObservationUnavailableGeneration.get(agentId);
     try {
-      await this.turnObservationStore?.markTelemetryIncomplete(agentId);
+      await store.markTelemetryIncomplete(agentId);
+      this.clearTurnObservationUnavailableIfUnchanged(agentId, generation);
     } catch (error) {
-      this.turnObservationUnavailable.add(agentId);
+      this.markTurnObservationUnavailable(agentId);
       this.logger.error(
         { err: error, agentId },
         "Failed to read the latest turn while reconciling unassigned telemetry",
       );
     }
+  }
+
+  private async reconcileTurnObservationUnavailableAfterWrite(agentId: string): Promise<void> {
+    if (!this.turnObservationUnavailable.has(agentId)) return;
+    const store = this.turnObservationStore;
+    if (!store) return;
+    const generation = this.turnObservationUnavailableGeneration.get(agentId);
+    try {
+      // The failed write may have hidden an effect. Persist an unknown marker before
+      // clearing the in-memory refusal so a daemon restart cannot forget that gap.
+      await store.markTelemetryIncomplete(agentId);
+      this.clearTurnObservationUnavailableIfUnchanged(agentId, generation);
+    } catch {
+      // Keep refusing continuation until an incomplete marker is durably written.
+    }
+  }
+
+  private markTurnObservationUnavailable(agentId: string): void {
+    this.turnObservationUnavailable.add(agentId);
+    this.turnObservationUnavailableGeneration.set(
+      agentId,
+      (this.turnObservationUnavailableGeneration.get(agentId) ?? 0) + 1,
+    );
+  }
+
+  private clearTurnObservationUnavailableIfUnchanged(
+    agentId: string,
+    generation: number | undefined,
+  ): void {
+    if (
+      generation === undefined ||
+      this.turnObservationUnavailableGeneration.get(agentId) !== generation
+    ) {
+      return;
+    }
+    this.turnObservationUnavailable.delete(agentId);
+    this.turnObservationUnavailableGeneration.delete(agentId);
   }
 
   private traceHandleStreamEventStart(
