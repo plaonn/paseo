@@ -160,6 +160,13 @@ const CODEX_TOOL_THREAD_ITEM_TYPES = new Set([
   "collabAgentToolCall",
   "subAgentActivity",
 ]);
+const CODEX_KNOWN_NO_EFFECT_THREAD_ITEM_TYPES = new Set([
+  "userMessage",
+  "reasoning",
+  "plan",
+  "contextCompaction",
+  "agentMessage",
+]);
 const CODEX_CONTEXT_COMPACTION_TYPE = "contextCompaction";
 const CODEX_PLAN_IMPLEMENTATION_PROMPT_PREFIX =
   "The user approved the plan. Implement it now. Do not restate or revise the plan unless blocked.";
@@ -1899,6 +1906,27 @@ export function threadItemToTimeline(
   }
 }
 
+function codexThreadItemHasCompleteEffectMapping(item: unknown, cwd: string | null): boolean {
+  const itemRecord = toObjectRecord(item);
+  if (!itemRecord) return false;
+  const normalizedType = normalizeCodexThreadItemType(
+    typeof itemRecord.type === "string" ? itemRecord.type : undefined,
+  );
+  if (!normalizedType) return false;
+  if (CODEX_KNOWN_NO_EFFECT_THREAD_ITEM_TYPES.has(normalizedType)) return true;
+  if (!CODEX_TOOL_THREAD_ITEM_TYPES.has(normalizedType)) return false;
+  try {
+    return (
+      mapCodexToolCallFromThreadItem(
+        normalizedType === itemRecord.type ? itemRecord : { ...itemRecord, type: normalizedType },
+        { cwd },
+      ) !== null
+    );
+  } catch {
+    return false;
+  }
+}
+
 function mcpToolResultImagesToTimeline(item: unknown): AgentTimelineItem[] {
   const itemRecord = toObjectRecord(item);
   if (!itemRecord) {
@@ -2127,9 +2155,10 @@ const TurnCompletedNotificationSchema = z
         status: z.string(),
         error: z
           .object({
-            message: z.string().optional(),
-            code: z.union([z.string(), z.number()]).optional(),
-            type: z.string().optional(),
+            message: z.string(),
+            additionalDetails: z.string().nullable().optional(),
+            codexErrorInfo: z.unknown().optional(),
+            misalignment: z.unknown().nullable().optional(),
           })
           .passthrough()
           .nullable()
@@ -2419,8 +2448,8 @@ type ParsedCodexNotification =
       kind: "turn_completed";
       status: string;
       errorMessage: string | null;
-      errorCode: string | number | null;
       errorClass: string | null;
+      errorRawValue: unknown | null;
       threadId: string | null;
     }
   | {
@@ -2573,8 +2602,11 @@ const CodexNotificationSchema = z.union([
         kind: "turn_completed",
         status: params.turn.status,
         errorMessage: params.turn.error?.message ?? null,
-        errorCode: params.turn.error?.code ?? null,
-        errorClass: params.turn.error?.type ?? null,
+        errorClass:
+          typeof params.turn.error?.codexErrorInfo === "string"
+            ? params.turn.error.codexErrorInfo
+            : null,
+        errorRawValue: params.turn.error ?? null,
         threadId: params.threadId ?? null,
       }),
     ),
@@ -2999,8 +3031,8 @@ const CodexNotificationSchema = z.union([
         kind: "turn_completed",
         status: "interrupted",
         errorMessage: null,
-        errorCode: null,
         errorClass: null,
+        errorRawValue: null,
         threadId: getCodexEventThreadId(params),
       }),
     ),
@@ -3021,8 +3053,8 @@ const CodexNotificationSchema = z.union([
         kind: "turn_completed",
         status: "completed",
         errorMessage: null,
-        errorCode: null,
         errorClass: null,
+        errorRawValue: null,
         threadId: getCodexEventThreadId(params),
       }),
     ),
@@ -5348,7 +5380,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         this.handleItemStartedNotification(parsed);
         return;
       case "invalid_payload":
-        this.warnInvalidNotificationPayload(parsed.method, parsed.params);
+        this.handleInvalidNotificationPayload(parsed);
         return;
       case "unknown_method":
         this.warnUnknownNotificationMethod(parsed.method, parsed.params);
@@ -5402,6 +5434,20 @@ export class CodexAppServerAgentSession implements AgentSession {
         this.dispatchSubAgentNotification(parsed, callId);
       }
     }
+  }
+
+  private handleInvalidNotificationPayload(
+    parsed: Extract<ParsedCodexNotification, { kind: "invalid_payload" }>,
+  ): void {
+    if (
+      parsed.method.startsWith("item/") ||
+      parsed.method === "codex/event/item_started" ||
+      parsed.method === "codex/event/item_completed" ||
+      parsed.method === "turn/completed"
+    ) {
+      this.markCurrentTurnObservationIncomplete();
+    }
+    this.warnInvalidNotificationPayload(parsed.method, parsed.params);
   }
 
   private handleThreadStateNotification(parsed: ParsedCodexNotification): boolean {
@@ -5973,10 +6019,8 @@ export class CodexAppServerAgentSession implements AgentSession {
         type: "turn_failed",
         provider: CODEX_PROVIDER,
         error: parsed.errorMessage ?? "Codex turn failed",
-        ...(parsed.errorCode !== null
-          ? { code: String(parsed.errorCode), providerCode: parsed.errorCode }
-          : {}),
         ...(parsed.errorClass !== null ? { providerClass: parsed.errorClass } : {}),
+        ...(parsed.errorRawValue !== null ? { providerRawValue: parsed.errorRawValue } : {}),
       });
     } else if (parsed.status === "interrupted") {
       this.dismissInterruptedAsyncQuestions();
@@ -6372,6 +6416,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   private handleItemCompletedNotification(
     parsed: Extract<ParsedCodexNotification, { kind: "item_completed" }>,
   ): void {
+    this.observeRawCodexThreadItem(parsed.item, parsed.turnId);
     // Codex emits mirrored lifecycle notifications via both `codex/event/item_*`
     // and canonical `item/*`. Render ordinary items only from the canonical
     // channel, but accept a legacy-only child announcement so it can establish
@@ -6532,6 +6577,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   private handleItemStartedNotification(
     parsed: Extract<ParsedCodexNotification, { kind: "item_started" }>,
   ): void {
+    this.observeRawCodexThreadItem(parsed.item, parsed.turnId);
     if (shouldIgnoreMirroredLifecycleItem(parsed.source, parsed.item)) {
       return;
     }
@@ -6601,6 +6647,27 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.pendingFileChangeOutputDeltas.delete(itemId);
     }
     this.replayPendingSubAgentNotifications(registeredChildThreadIds);
+  }
+
+  private observeRawCodexThreadItem(item: unknown, turnId: string | null): void {
+    if (codexThreadItemHasCompleteEffectMapping(item, this.config.cwd ?? null)) return;
+    const observedTurnId = this.activeForegroundTurnId ?? this.currentTurnId ?? turnId ?? undefined;
+    if (!observedTurnId) return;
+    this.emitEvent({
+      type: "turn_observation_incomplete",
+      provider: CODEX_PROVIDER,
+      turnId: observedTurnId,
+    });
+  }
+
+  private markCurrentTurnObservationIncomplete(): void {
+    const turnId = this.activeForegroundTurnId ?? this.currentTurnId;
+    if (!turnId) return;
+    this.emitEvent({
+      type: "turn_observation_incomplete",
+      provider: CODEX_PROVIDER,
+      turnId,
+    });
   }
 
   private handleUserMessageItem(

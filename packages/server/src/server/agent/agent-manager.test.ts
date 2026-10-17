@@ -11030,6 +11030,8 @@ test("concurrent native restores run once before resuming the same agent", async
 
 class TurnRecoverySession extends TestAgentSession {
   readonly prompts: AgentPromptInput[] = [];
+  readonly secondStartEntered = deferred<void>();
+  readonly allowSecondStart = deferred<void>();
   startCount = 0;
 
   constructor(
@@ -11037,7 +11039,9 @@ class TurnRecoverySession extends TestAgentSession {
     private readonly options: {
       firstTimelineItem?: AgentTimelineItem;
       holdSecondTurn?: boolean;
+      holdSecondStart?: boolean;
       rejectFirstStart?: boolean;
+      rejectFirstStartWithoutTypedInfo?: boolean;
     } = {},
   ) {
     super(config);
@@ -11048,10 +11052,24 @@ class TurnRecoverySession extends TestAgentSession {
     this.prompts.push(prompt);
     const count = this.startCount;
     const turnId = `recovery-turn-${count}`;
+    if (count === 2 && this.options.holdSecondStart) {
+      this.secondStartEntered.resolve();
+      await this.allowSecondStart.promise;
+    }
+    if (count === 1 && this.options.rejectFirstStartWithoutTypedInfo) {
+      throw Object.assign(
+        new Error("Selected model is at capacity. Please try a different model."),
+        { code: -32001 },
+      );
+    }
     if (count === 1 && this.options.rejectFirstStart) {
       throw Object.assign(
         new Error("Selected model is at capacity. Please try a different model."),
-        { code: "server_overloaded" },
+        {
+          code: -32001,
+          // Assumed JSON-RPC error.data payload; the bundled schema types data as arbitrary JSON.
+          data: { codexErrorInfo: "serverOverloaded" },
+        },
       );
     }
     setTimeout(() => {
@@ -11070,8 +11088,11 @@ class TurnRecoverySession extends TestAgentSession {
           provider: this.provider,
           turnId,
           error: "Selected model is at capacity. Please try a different model.",
-          providerCode: "server_overloaded",
-          providerClass: "server_overloaded",
+          providerClass: "serverOverloaded",
+          providerRawValue: {
+            message: "Selected model is at capacity. Please try a different model.",
+            codexErrorInfo: "serverOverloaded",
+          },
         });
         return;
       }
@@ -11092,12 +11113,16 @@ class TurnRecoverySession extends TestAgentSession {
       });
     }
   }
+
+  async setFeature(): Promise<void> {}
 }
 
 async function createTurnRecoveryFixture(options?: {
   firstTimelineItem?: AgentTimelineItem;
   holdSecondTurn?: boolean;
+  holdSecondStart?: boolean;
   rejectFirstStart?: boolean;
+  rejectFirstStartWithoutTypedInfo?: boolean;
 }): Promise<{
   manager: AgentManager;
   storage: AgentStorage;
@@ -11170,8 +11195,8 @@ test("continues a proven no-effect capacity failure once on the same provider se
     expect(observation).toMatchObject({
       status: "failed",
       error: {
-        providerCode: "server_overloaded",
-        providerClass: "server_overloaded",
+        providerCode: null,
+        providerClass: "serverOverloaded",
         normalizedClass: "capacity_overload",
       },
       effects: { state: "none_proven" },
@@ -11224,7 +11249,8 @@ test("records and continues a typed Codex capacity rejection before the provider
       turnId: expect.stringMatching(/^paseo-start-/),
       status: "failed",
       error: {
-        providerCode: "server_overloaded",
+        providerCode: -32001,
+        providerClass: "serverOverloaded",
         normalizedClass: "capacity_overload",
       },
       effects: { state: "none_proven" },
@@ -11246,6 +11272,34 @@ test("records and continues a typed Codex capacity rejection before the provider
       "original controller prompt",
       "controller continuation prompt, verbatim",
     ]);
+  } finally {
+    await fixture.manager.closeAgent(fixture.agentId).catch(() => undefined);
+    await fixture.storage.flush();
+    rmSync(fixture.workdir, { recursive: true, force: true });
+  }
+});
+
+test("does not infer overload from a JSON-RPC number or message text alone", async () => {
+  const fixture = await createTurnRecoveryFixture({ rejectFirstStartWithoutTypedInfo: true });
+  try {
+    await expect(
+      fixture.manager.runAgent(fixture.agentId, "original controller prompt"),
+    ).rejects.toThrow("Selected model is at capacity");
+    const observation = await fixture.manager.observeTurn(fixture.agentId);
+    expect(observation).toMatchObject({
+      status: "failed",
+      error: {
+        providerCode: -32001,
+        providerClass: null,
+        normalizedClass: "unknown",
+      },
+      effects: { state: "unknown" },
+      complete: false,
+    });
+    await expect(
+      fixture.manager.continueAfterFailure(continuationInput(fixture.agentId, observation!)),
+    ).resolves.toEqual({ status: "refused", reason: "telemetry_incomplete" });
+    expect(fixture.session.startCount).toBe(1);
   } finally {
     await fixture.manager.closeAgent(fixture.agentId).catch(() => undefined);
     await fixture.storage.flush();
@@ -11327,7 +11381,7 @@ test("refuses continuation after a tool action or truncated Codex telemetry", as
     ).resolves.toEqual({ status: "refused", reason: "telemetry_incomplete" });
     await expect(unknownFixture.manager.observeTurn(unknownFixture.agentId)).resolves.toMatchObject(
       {
-        effects: { state: "unknown", reason: "telemetry_write_failed" },
+        effects: { state: "unknown", reason: "telemetry_incomplete" },
         complete: false,
         truncated: false,
       },
@@ -11374,6 +11428,22 @@ test("refuses when the failed turn is not last, config drifted, a prompt is admi
     await configFixture.manager.closeAgent(configFixture.agentId).catch(() => undefined);
     await configFixture.storage.flush();
     rmSync(configFixture.workdir, { recursive: true, force: true });
+  }
+
+  const featureFixture = await createTurnRecoveryFixture();
+  try {
+    const observation = await failFirstRecoveryTurn(featureFixture.manager, featureFixture.agentId);
+    await featureFixture.manager.setAgentFeature(featureFixture.agentId, "serviceTier", "fast");
+    await expect(
+      featureFixture.manager.continueAfterFailure(
+        continuationInput(featureFixture.agentId, observation),
+      ),
+    ).resolves.toEqual({ status: "refused", reason: "config_changed" });
+    expect(featureFixture.session.startCount).toBe(1);
+  } finally {
+    await featureFixture.manager.closeAgent(featureFixture.agentId).catch(() => undefined);
+    await featureFixture.storage.flush();
+    rmSync(featureFixture.workdir, { recursive: true, force: true });
   }
 
   const admissionFixture = await createTurnRecoveryFixture();
@@ -11430,6 +11500,27 @@ test("refuses continuation while a turn is active", async () => {
     ).resolves.toEqual({ status: "refused", reason: "active_turn" });
     expect(fixture.session.startCount).toBe(2);
   } finally {
+    await fixture.manager.closeAgent(fixture.agentId).catch(() => undefined);
+    await fixture.storage.flush();
+    rmSync(fixture.workdir, { recursive: true, force: true });
+  }
+});
+
+test("blocks provider feature changes while continuation is being admitted", async () => {
+  const fixture = await createTurnRecoveryFixture({ holdSecondStart: true });
+  try {
+    const observation = await failFirstRecoveryTurn(fixture.manager, fixture.agentId);
+    const continuation = fixture.manager.continueAfterFailure(
+      continuationInput(fixture.agentId, observation),
+    );
+    await fixture.session.secondStartEntered.promise;
+    await expect(
+      fixture.manager.setAgentFeature(fixture.agentId, "serviceTier", "fast"),
+    ).rejects.toThrow("Agent continuation is being admitted");
+    fixture.session.allowSecondStart.resolve();
+    await expect(continuation).resolves.toMatchObject({ status: "receipt" });
+  } finally {
+    fixture.session.allowSecondStart.resolve();
     await fixture.manager.closeAgent(fixture.agentId).catch(() => undefined);
     await fixture.storage.flush();
     rmSync(fixture.workdir, { recursive: true, force: true });

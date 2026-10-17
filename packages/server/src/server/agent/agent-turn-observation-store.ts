@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 
@@ -51,6 +51,7 @@ const EffectsSchema = z.discriminatedUnion("state", [
 const ProviderErrorSchema = z.object({
   providerCode: z.union([z.string(), z.number()]).nullable(),
   providerClass: z.string().nullable(),
+  providerRawValue: z.unknown().nullable().optional(),
   rawMessage: z.string(),
   normalizedClass: z.enum(["capacity_overload", "unknown"]),
 });
@@ -65,6 +66,7 @@ const TurnObservationSchema = z.object({
   model: z.string().nullable(),
   thinkingEffort: z.string().nullable(),
   mode: z.string().nullable(),
+  cwd: z.string().nullable().optional(),
   configDigest: z.string(),
   configComplete: z.boolean(),
   startedAt: z.string(),
@@ -92,6 +94,17 @@ const ReceiptSchema = z.object({
   configDigest: z.string(),
   state: z.enum(["pending", "outcome_unknown", "started"]),
 });
+const ReceiptLedgerEntrySchema = z.object({
+  fingerprint: z.string(),
+  receipt: ReceiptSchema,
+});
+const ReceiptLedgerSchema = z.object({
+  version: z.literal(1),
+  entries: z.array(ReceiptLedgerEntrySchema),
+});
+
+const MAX_RETAINED_TURNS = 32;
+const JOURNAL_WRITE_DEBOUNCE_MS = 75;
 
 export type AgentTurnObservation = z.infer<typeof TurnObservationSchema>;
 export type AgentTurnEffects = z.infer<typeof EffectsSchema>;
@@ -103,6 +116,8 @@ export interface AgentTurnConfigSnapshot {
   model: string | null;
   thinkingEffort: string | null;
   mode: string | null;
+  cwd?: string | null;
+  features?: Record<string, unknown>;
 }
 
 export interface AgentTurnStartInput {
@@ -120,6 +135,7 @@ export interface AgentTurnFinishInput {
   status: "completed" | "failed" | "cancelled" | "unknown";
   providerCode: string | number | null;
   providerClass: string | null;
+  providerRawValue?: unknown;
   rawMessage: string | null;
   telemetryIncomplete?: boolean;
   finishedAt?: string;
@@ -148,11 +164,21 @@ export function digestAgentTurnConfig(input: {
   agentId: string;
   workspaceId: string | null;
   provider: string;
+  cwd?: string | null;
+  features?: Record<string, unknown>;
   model: string | null;
   thinkingEffort: string | null;
   mode: string | null;
 }): string {
-  return createHash("sha256").update(stableStringify(input)).digest("hex");
+  return createHash("sha256")
+    .update(
+      stableStringify({
+        ...input,
+        cwd: input.cwd ?? null,
+        features: input.features ?? {},
+      }),
+    )
+    .digest("hex");
 }
 
 function digest(value: unknown): string {
@@ -221,8 +247,7 @@ function hasEffects(manifest: AgentTurnEffectManifest): boolean {
     manifest.fileWrites.length > 0 ||
     manifest.shellCommands.length > 0 ||
     manifest.messageDeliveries.length > 0 ||
-    manifest.subAgentSpawns.length > 0 ||
-    manifest.assistantResponses > 0
+    manifest.subAgentSpawns.length > 0
   );
 }
 
@@ -253,19 +278,23 @@ function finishedEffects(
   }
   let reason = "provider_unverified";
   if (observation.truncated) reason = "timeline_truncated";
-  else if (observation.telemetryFailed) reason = "telemetry_write_failed";
+  else if (observation.telemetryFailed) reason = "telemetry_incomplete";
   return { state: "unknown", reason, observed: manifest };
 }
 
-function providerError(input: AgentTurnFinishInput): AgentTurnProviderError | null {
+function providerError(
+  observation: AgentTurnObservation,
+  input: AgentTurnFinishInput,
+): AgentTurnProviderError | null {
   if (input.status !== "failed") return null;
   const normalizedClass =
-    input.providerCode === "server_overloaded" || input.providerClass === "server_overloaded"
+    observation.provider === "codex" && input.providerClass === "serverOverloaded"
       ? "capacity_overload"
       : "unknown";
   return {
     providerCode: input.providerCode,
     providerClass: input.providerClass,
+    providerRawValue: input.providerRawValue ?? null,
     rawMessage: input.rawMessage ?? "",
     normalizedClass,
   };
@@ -280,8 +309,11 @@ function isTruncatedItem(item: AgentTimelineItem): boolean {
 
 function applyTimelineItem(observation: AgentTurnObservation, item: AgentTimelineItem): void {
   const manifest = manifestFromEffects(observation.effects);
-  if (item.type === "assistant_message") manifest.assistantResponses += 1;
   if (item.type === "tool_call") {
+    if (item.detail.type === "plan") {
+      observation.effects = observeEffects(observation, manifest);
+      return;
+    }
     upsertById(manifest.toolCalls, { callId: item.callId, name: item.name, status: item.status });
     if (item.detail.type === "write" || item.detail.type === "edit") {
       const filePath = item.detail.filePath;
@@ -322,7 +354,11 @@ function applyTimelineItem(observation: AgentTurnObservation, item: AgentTimelin
 
 export class AgentTurnObservationStore {
   private readonly agentTails = new Map<string, Promise<unknown>>();
-  private readonly receiptTails = new Map<string, Promise<unknown>>();
+  private readonly journalCache = new Map<string, z.infer<typeof JournalSchema>>();
+  private readonly journalFlushTimers = new Map<string, NodeJS.Timeout>();
+  private readonly journalWriteGenerations = new Map<string, number>();
+  private receiptLedgerTail: Promise<unknown> = Promise.resolve();
+  private receiptLedger: z.infer<typeof ReceiptLedgerSchema> | null = null;
 
   constructor(private readonly directory: string) {}
 
@@ -336,6 +372,8 @@ export class AgentTurnObservationStore {
         agentId: input.agentId,
         workspaceId: input.workspaceId,
         provider: input.provider,
+        cwd: input.config.cwd ?? null,
+        features: input.config.features ?? {},
         model: input.config.model,
         thinkingEffort: input.config.thinkingEffort,
         mode: input.config.mode,
@@ -350,9 +388,13 @@ export class AgentTurnObservationStore {
         model: input.config.model,
         thinkingEffort: input.config.thinkingEffort,
         mode: input.config.mode,
+        cwd: input.config.cwd ?? null,
         configDigest: digestAgentTurnConfig(config),
         configComplete:
           input.provider.length > 0 &&
+          typeof input.config.cwd === "string" &&
+          input.config.cwd.length > 0 &&
+          input.config.features !== undefined &&
           input.config.model !== null &&
           input.config.thinkingEffort !== null &&
           input.config.mode !== null,
@@ -370,6 +412,9 @@ export class AgentTurnObservationStore {
       };
       journal.nextOrder += 1;
       journal.turns.push(observation);
+      if (journal.turns.length > MAX_RETAINED_TURNS) {
+        journal.turns.splice(0, journal.turns.length - MAX_RETAINED_TURNS);
+      }
       await this.writeJournal(input.agentId, journal);
     });
   }
@@ -383,16 +428,18 @@ export class AgentTurnObservationStore {
       const journal = await this.readJournal(agentId);
       const observation = journal.turns.find((turn) => turn.turnId === turnId);
       if (!observation) return;
+      if (observation.provider !== "codex") return;
       applyTimelineItem(observation, item);
       if (observation.telemetryFailed) {
         observation.complete = false;
         observation.effects = {
           state: "unknown",
-          reason: "telemetry_write_failed",
+          reason: "telemetry_incomplete",
           observed: manifestFromEffects(observation.effects),
         };
       }
-      await this.writeJournal(agentId, journal);
+      if (observation.status === "running") this.scheduleJournalWrite(agentId);
+      else await this.writeJournal(agentId, journal);
     });
   }
 
@@ -405,10 +452,11 @@ export class AgentTurnObservationStore {
       observation.complete = false;
       observation.effects = {
         state: "unknown",
-        reason: "telemetry_write_failed",
+        reason: "telemetry_incomplete",
         observed: manifestFromEffects(observation.effects),
       };
-      await this.writeJournal(agentId, journal);
+      if (observation.status === "running") this.scheduleJournalWrite(agentId);
+      else await this.writeJournal(agentId, journal);
     });
   }
 
@@ -422,6 +470,7 @@ export class AgentTurnObservationStore {
       const journal = await this.readJournal(agentId);
       const observation = journal.turns.find((turn) => turn.turnId === turnId);
       if (!observation) return;
+      if (observation.provider !== "codex") return;
       const manifest = manifestFromEffects(observation.effects);
       const existingIndex = manifest.subAgentSpawns.findIndex((entry) => entry.id === subAgentId);
       if (existingIndex === -1) manifest.subAgentSpawns.push({ id: subAgentId, status });
@@ -431,9 +480,7 @@ export class AgentTurnObservationStore {
           ? { state: "present", ...manifest }
           : {
               state: "unknown",
-              reason: observation.telemetryFailed
-                ? "telemetry_write_failed"
-                : "provider_unverified",
+              reason: observation.telemetryFailed ? "telemetry_incomplete" : "provider_unverified",
               observed: manifest,
             };
       await this.writeJournal(agentId, journal);
@@ -449,6 +496,7 @@ export class AgentTurnObservationStore {
       const journal = await this.readJournal(agentId);
       let changed = false;
       for (const observation of journal.turns) {
+        if (observation.provider !== "codex") continue;
         const manifest = manifestFromEffects(observation.effects);
         const subAgent = manifest.subAgentSpawns.find((entry) => entry.id === subAgentId);
         if (!subAgent || subAgent.status === status) continue;
@@ -459,7 +507,7 @@ export class AgentTurnObservationStore {
             : {
                 state: "unknown",
                 reason: observation.telemetryFailed
-                  ? "telemetry_write_failed"
+                  ? "telemetry_incomplete"
                   : "provider_unverified",
                 observed: manifest,
               };
@@ -483,6 +531,7 @@ export class AgentTurnObservationStore {
       const journal = await this.readJournal(agentId);
       const observation = journal.turns.find((turn) => turn.turnId === turnId);
       if (!observation) return;
+      if (observation.provider !== "codex") return;
       const manifest = manifestFromEffects(observation.effects);
       upsertById(manifest.messageDeliveries, delivery);
       observation.effects =
@@ -490,9 +539,7 @@ export class AgentTurnObservationStore {
           ? { state: "present", ...manifest }
           : {
               state: "unknown",
-              reason: observation.telemetryFailed
-                ? "telemetry_write_failed"
-                : "provider_unverified",
+              reason: observation.telemetryFailed ? "telemetry_incomplete" : "provider_unverified",
               observed: manifest,
             };
       await this.writeJournal(agentId, journal);
@@ -508,7 +555,7 @@ export class AgentTurnObservationStore {
         observation.telemetryFailed || input.telemetryIncomplete === true;
       observation.status = input.status;
       observation.finishedAt = input.finishedAt ?? new Date().toISOString();
-      observation.error = providerError(input);
+      observation.error = providerError(observation, input);
       observation.complete =
         observation.provider === "codex" && !observation.truncated && !observation.telemetryFailed;
       const manifest = manifestFromEffects(observation.effects);
@@ -543,27 +590,37 @@ export class AgentTurnObservationStore {
   }
 
   async runContinuation(
-    input: { key: string; parameters: unknown },
+    input: { key: string; agentId: string; turnId: string; parameters: unknown },
     prepare: () => Promise<AgentTurnContinuationPreparation>,
   ): Promise<AgentTurnContinuationResult> {
     if (!input.key.trim() || input.key.length > 200) {
       return { status: "refused", reason: "invalid_idempotency_key" };
     }
-    return this.withReceiptLock(input.key, async () => {
-      const receiptPath = this.receiptPath(input.key);
+    return this.withReceiptLedgerLock(async () => {
       const requestDigest = digest(input.parameters);
-      const existing = await this.readReceipt(receiptPath);
+      const ledger = await this.readReceiptLedger();
+      const existing = ledger.entries.find((entry) => entry.receipt.key === input.key);
       if (existing) {
-        const existingRequestDigest = await this.readReceiptFingerprint(receiptPath);
-        if (existingRequestDigest !== requestDigest) {
+        if (existing.fingerprint !== requestDigest) {
           return { status: "refused", reason: "idempotency_key_conflict" };
         }
-        return { status: "receipt", receipt: existing, replayed: true };
+        return { status: "receipt", receipt: existing.receipt, replayed: true };
+      }
+
+      const previousAttempt = ledger.entries.find(
+        (entry) => entry.receipt.agentId === input.agentId && entry.receipt.turnId === input.turnId,
+      );
+      if (previousAttempt) {
+        return { status: "refused", reason: "continuation_already_attempted" };
       }
 
       const preparation = await prepare();
       if (preparation.status === "refused") {
         return preparation;
+      }
+      if (preparation.agentId !== input.agentId || preparation.turnId !== input.turnId) {
+        preparation.release();
+        return { status: "refused", reason: "turn_mismatch" };
       }
       const timestamp = new Date().toISOString();
       const pending: AgentTurnContinuationReceipt = {
@@ -576,9 +633,12 @@ export class AgentTurnObservationStore {
         configDigest: preparation.configDigest,
         state: "pending",
       };
+      const pendingEntry = { fingerprint: requestDigest, receipt: pending };
+      ledger.entries.push(pendingEntry);
       try {
-        await this.writeReceipt(receiptPath, requestDigest, pending);
+        await this.writeReceiptLedger(ledger);
       } catch (error) {
+        ledger.entries.pop();
         preparation.release();
         throw error;
       }
@@ -591,11 +651,12 @@ export class AgentTurnObservationStore {
           updatedAt: new Date().toISOString(),
           state: "started" as const,
         };
+        pendingEntry.receipt = started;
         try {
-          await this.writeReceipt(receiptPath, requestDigest, started);
+          await this.writeReceiptLedger(ledger);
           return { status: "receipt", receipt: started, replayed: false };
         } catch {
-          // The durable pending marker prevents a replay from sending again.
+          pendingEntry.receipt = pending;
           return { status: "receipt", receipt: pending, replayed: false };
         }
       } catch {
@@ -604,10 +665,12 @@ export class AgentTurnObservationStore {
           updatedAt: new Date().toISOString(),
           state: "outcome_unknown" as const,
         };
+        pendingEntry.receipt = outcomeUnknown;
         try {
-          await this.writeReceipt(receiptPath, requestDigest, outcomeUnknown);
+          await this.writeReceiptLedger(ledger);
           return { status: "receipt", receipt: outcomeUnknown, replayed: false };
         } catch {
+          pendingEntry.receipt = pending;
           return { status: "receipt", receipt: pending, replayed: false };
         }
       } finally {
@@ -620,47 +683,102 @@ export class AgentTurnObservationStore {
     return path.join(this.directory, "turn-observations", filenameFor(agentId));
   }
 
-  private receiptPath(key: string): string {
-    return path.join(this.directory, "turn-continuation-receipts", filenameFor(key));
+  private receiptLedgerPath(): string {
+    return path.join(this.directory, "turn-continuation-receipts", "ledger.json");
   }
 
   private async readJournal(agentId: string): Promise<z.infer<typeof JournalSchema>> {
-    const journal = await readJsonFile(this.agentPath(agentId), JournalSchema);
-    return journal ?? { version: 1, nextOrder: 0, turns: [] };
+    const cached = this.journalCache.get(agentId);
+    if (cached) return cached;
+    const loaded = await readJsonFile(this.agentPath(agentId), JournalSchema);
+    const journal = loaded ?? { version: 1 as const, nextOrder: 0, turns: [] };
+    if (journal.turns.length > MAX_RETAINED_TURNS) {
+      journal.turns.splice(0, journal.turns.length - MAX_RETAINED_TURNS);
+      this.journalCache.set(agentId, journal);
+      await this.writeJournal(agentId, journal);
+      return journal;
+    }
+    this.journalCache.set(agentId, journal);
+    return journal;
   }
 
   private async writeJournal(agentId: string, value: z.infer<typeof JournalSchema>): Promise<void> {
-    await writeJsonFileAtomic(this.agentPath(agentId), JournalSchema.parse(value));
+    this.cancelScheduledJournalWrite(agentId);
+    const validated = JournalSchema.parse(value);
+    await writeJsonFileAtomic(this.agentPath(agentId), validated);
+    this.journalCache.set(agentId, validated);
   }
 
-  private async readReceipt(file: string): Promise<AgentTurnContinuationReceipt | null> {
-    const entry = await readJsonFile(
-      file,
-      z.object({
-        fingerprint: z.string(),
-        receipt: ReceiptSchema,
-      }),
-    );
-    return entry?.receipt ?? null;
+  private async readReceiptLedger(): Promise<z.infer<typeof ReceiptLedgerSchema>> {
+    if (this.receiptLedger) return this.receiptLedger;
+    const current = await readJsonFile(this.receiptLedgerPath(), ReceiptLedgerSchema);
+    if (current) {
+      this.receiptLedger = current;
+      return current;
+    }
+
+    const entries: z.infer<typeof ReceiptLedgerEntrySchema>[] = [];
+    let files: string[] = [];
+    try {
+      files = await readdir(path.dirname(this.receiptLedgerPath()));
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+    }
+    for (const name of files) {
+      if (!name.endsWith(".json") || name === "ledger.json") continue;
+      const entry = await readJsonFile(
+        path.join(path.dirname(this.receiptLedgerPath()), name),
+        ReceiptLedgerEntrySchema,
+      );
+      if (entry) entries.push(entry);
+    }
+    const ledger = { version: 1 as const, entries };
+    if (entries.length > 0) await this.writeReceiptLedger(ledger);
+    this.receiptLedger = ledger;
+    return ledger;
   }
 
-  private async readReceiptFingerprint(file: string): Promise<string | null> {
-    const entry = await readJsonFile(
-      file,
-      z.object({
-        fingerprint: z.string(),
-        receipt: ReceiptSchema,
-      }),
-    );
-    return entry?.fingerprint ?? null;
+  private async writeReceiptLedger(ledger: z.infer<typeof ReceiptLedgerSchema>): Promise<void> {
+    const validated = ReceiptLedgerSchema.parse(ledger);
+    await writeJsonFileAtomic(this.receiptLedgerPath(), validated);
+    this.receiptLedger = validated;
   }
 
-  private async writeReceipt(
-    file: string,
-    fingerprint: string,
-    receipt: AgentTurnContinuationReceipt,
-  ): Promise<void> {
-    await writeJsonFileAtomic(file, { fingerprint, receipt: ReceiptSchema.parse(receipt) });
+  private scheduleJournalWrite(agentId: string): void {
+    const current = this.journalFlushTimers.get(agentId);
+    if (current) clearTimeout(current);
+    const generation = (this.journalWriteGenerations.get(agentId) ?? 0) + 1;
+    this.journalWriteGenerations.set(agentId, generation);
+    const timer = setTimeout(() => {
+      this.journalFlushTimers.delete(agentId);
+      void this.withAgentLock(agentId, async () => {
+        if (this.journalWriteGenerations.get(agentId) !== generation) return;
+        const journal = this.journalCache.get(agentId);
+        if (journal)
+          await writeJsonFileAtomic(this.agentPath(agentId), JournalSchema.parse(journal));
+      }).catch(() => {
+        // An unflushed active turn remains durably marked running and incomplete.
+      });
+    }, JOURNAL_WRITE_DEBOUNCE_MS);
+    this.journalFlushTimers.set(agentId, timer);
+  }
+
+  private cancelScheduledJournalWrite(agentId: string): void {
+    const timer = this.journalFlushTimers.get(agentId);
+    if (timer) clearTimeout(timer);
+    this.journalFlushTimers.delete(agentId);
+    this.journalWriteGenerations.set(agentId, (this.journalWriteGenerations.get(agentId) ?? 0) + 1);
+  }
+
+  private async withReceiptLedgerLock<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.receiptLedgerTail;
+    const result = previous.catch(() => undefined).then(operation);
+    this.receiptLedgerTail = result;
+    try {
+      return await result;
+    } finally {
+      if (this.receiptLedgerTail === result) this.receiptLedgerTail = Promise.resolve();
+    }
   }
 
   private async withAgentLock<T>(agentId: string, operation: () => Promise<T>): Promise<T> {
@@ -671,17 +789,6 @@ export class AgentTurnObservationStore {
       return await result;
     } finally {
       if (this.agentTails.get(agentId) === result) this.agentTails.delete(agentId);
-    }
-  }
-
-  private async withReceiptLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
-    const previous = this.receiptTails.get(key);
-    const result = (previous ? previous.catch(() => undefined) : Promise.resolve()).then(operation);
-    this.receiptTails.set(key, result);
-    try {
-      return await result;
-    } finally {
-      if (this.receiptTails.get(key) === result) this.receiptTails.delete(key);
     }
   }
 }

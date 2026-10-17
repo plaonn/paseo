@@ -19,6 +19,7 @@ import {
 import type { Logger } from "pino";
 import type { ProviderOptions, ToolPolicy } from "@getpaseo/protocol/agent-types";
 import type { ProviderPaseoToolsPolicy } from "@getpaseo/protocol/provider-config";
+import { AGENT_TURN_CONTINUATION_PROMPT_MAX_LENGTH } from "@getpaseo/protocol/messages";
 import { z } from "zod";
 import type { TerminalManager } from "../../terminal/terminal-manager.js";
 
@@ -490,39 +491,54 @@ type ContinuationAgentResult =
 
 function agentTurnConfig(agent: {
   config: AgentSessionConfig;
+  cwd: string;
   currentModeId: string | null;
   runtimeInfo?: AgentRuntimeInfo;
-}): { model: string | null; thinkingEffort: string | null; mode: string | null } {
+}): {
+  model: string | null;
+  thinkingEffort: string | null;
+  mode: string | null;
+  cwd: string | null;
+  features: Record<string, unknown>;
+} {
   return {
     model: agent.runtimeInfo?.model ?? agent.config.model ?? null,
     thinkingEffort: agent.runtimeInfo?.thinkingOptionId ?? agent.config.thinkingOptionId ?? null,
     mode: agent.runtimeInfo?.modeId ?? agent.currentModeId ?? agent.config.modeId ?? null,
+    cwd: agent.cwd,
+    features: agent.config.featureValues ?? {},
   };
 }
 
 function providerFailureDetails(
   provider: AgentProvider,
   error: unknown,
-): { providerCode?: string | number; providerClass?: string } {
+): { providerCode?: string | number; providerClass?: string; providerRawValue?: unknown } {
   if (provider !== "codex" || typeof error !== "object" || error === null) return {};
-  const value = error as { code?: unknown; type?: unknown };
-  const details: { providerCode?: string | number; providerClass?: string } = {};
+  const value = error as { code?: unknown; data?: unknown };
+  const data =
+    typeof value.data === "object" && value.data !== null
+      ? (value.data as Record<string, unknown>)
+      : null;
+  const codexErrorInfo = data?.codexErrorInfo;
+  const details: {
+    providerCode?: string | number;
+    providerClass?: string;
+    providerRawValue?: unknown;
+  } = {};
   if (typeof value.code === "string" || typeof value.code === "number") {
     details.providerCode = value.code;
   }
-  if (typeof value.type === "string") details.providerClass = value.type;
+  if (typeof codexErrorInfo === "string") details.providerClass = codexErrorInfo;
+  if (value.data !== undefined) details.providerRawValue = value.data;
   return details;
 }
 
 function isTypedCapacityRejection(
   provider: AgentProvider,
-  providerCode: string | number | undefined,
   providerClass: string | undefined,
 ): boolean {
-  return (
-    provider === "codex" &&
-    (providerCode === "server_overloaded" || providerClass === "server_overloaded")
-  );
+  return provider === "codex" && providerClass === "serverOverloaded";
 }
 
 type LiveManagedAgent = ActiveManagedAgent;
@@ -1046,11 +1062,16 @@ export class AgentManager {
   }): Promise<AgentTurnContinuationResult> {
     const store = this.turnObservationStore;
     if (!store) return { status: "refused", reason: "observation_unavailable" };
+    if (!input.prompt.trim() || input.prompt.length > AGENT_TURN_CONTINUATION_PROMPT_MAX_LENGTH) {
+      return { status: "refused", reason: "invalid_prompt" };
+    }
 
     return this.runLifecycleMutation(input.agentId, () =>
       store.runContinuation(
         {
           key: input.idempotencyKey,
+          agentId: input.agentId,
+          turnId: input.expectedTurnId,
           parameters: {
             agentId: input.agentId,
             expectedTurnId: input.expectedTurnId,
@@ -2281,17 +2302,21 @@ export class AgentManager {
   }
 
   async setAgentFeature(agentId: string, featureId: string, value: unknown): Promise<void> {
-    const agent = this.requireAgent(agentId);
+    const releaseMutation = this.beginConfigMutation(agentId);
+    try {
+      const agent = this.requireAgent(agentId);
+      if (!agent.session.setFeature) {
+        throw new Error("Agent session does not support setting features");
+      }
 
-    if (!agent.session.setFeature) {
-      throw new Error("Agent session does not support setting features");
+      await agent.session.setFeature(featureId, value);
+      await this.drainSessionEvents(agentId);
+      agent.config.featureValues = { ...agent.config.featureValues, [featureId]: value };
+      this.touchUpdatedAt(agent);
+      this.emitState(agent);
+    } finally {
+      releaseMutation();
     }
-
-    await agent.session.setFeature(featureId, value);
-    await this.drainSessionEvents(agentId);
-    agent.config.featureValues = { ...agent.config.featureValues, [featureId]: value };
-    this.touchUpdatedAt(agent);
-    this.emitState(agent);
   }
 
   async setTitle(agentId: string, title: string): Promise<void> {
@@ -2767,14 +2792,11 @@ export class AgentManager {
     error: unknown,
     errorMsg: string,
   ): Promise<void> {
-    const { providerCode, providerClass } = providerFailureDetails(agent.provider, error);
-    await this.persistFailedTurnStartObservation(
-      agent,
-      agentId,
-      turnId,
-      providerCode,
-      providerClass,
+    const { providerCode, providerClass, providerRawValue } = providerFailureDetails(
+      agent.provider,
+      error,
     );
+    await this.persistFailedTurnStartObservation(agent, agentId, turnId, providerClass);
     await this.handleStreamEvent(agent, {
       type: "turn_failed",
       provider: agent.provider,
@@ -2782,6 +2804,7 @@ export class AgentManager {
       error: errorMsg,
       ...(providerCode !== undefined ? { code: String(providerCode), providerCode } : {}),
       ...(providerClass !== undefined ? { providerClass } : {}),
+      ...(providerRawValue !== undefined ? { providerRawValue } : {}),
     });
   }
 
@@ -2789,7 +2812,6 @@ export class AgentManager {
     agent: ActiveManagedAgent,
     agentId: string,
     turnId: string,
-    providerCode: string | number | undefined,
     providerClass: string | undefined,
   ): Promise<void> {
     const store = this.turnObservationStore;
@@ -2802,7 +2824,7 @@ export class AgentManager {
         provider: agent.provider,
         config: agentTurnConfig(agent),
       });
-      if (!isTypedCapacityRejection(agent.provider, providerCode, providerClass)) {
+      if (!isTypedCapacityRejection(agent.provider, providerClass)) {
         await store.markTelemetryIncomplete(agentId, turnId);
       }
     } catch (observationError) {
@@ -4577,12 +4599,20 @@ export class AgentManager {
     const store = this.turnObservationStore;
     if (fromHistory || !store) return;
     if (!turnId) {
-      if (event.type === "timeline" || isTurnTerminalEvent(event)) {
+      if (
+        event.type === "timeline" ||
+        event.type === "turn_observation_incomplete" ||
+        isTurnTerminalEvent(event)
+      ) {
         await this.markLatestTurnObservationIncomplete(agent.id);
       }
       return;
     }
     try {
+      if (event.type === "turn_observation_incomplete") {
+        await store.markTelemetryIncomplete(agent.id, turnId);
+        return;
+      }
       if (event.type === "timeline") {
         await store.recordTimelineItem(agent.id, turnId, event.item);
         return;
@@ -4598,6 +4628,7 @@ export class AgentManager {
         status,
         providerCode: failed ? (event.providerCode ?? null) : null,
         providerClass: failed ? (event.providerClass ?? null) : null,
+        providerRawValue: failed ? (event.providerRawValue ?? null) : null,
         rawMessage: failed ? event.error : null,
         telemetryIncomplete: this.hasTurnObservationFailure(agent.id, turnId),
       });
@@ -4621,6 +4652,7 @@ export class AgentManager {
     event = identified.event;
     const eventTurnId = identified.turnId;
     await this.recordTurnObservationEvent(agent, event, eventTurnId, options?.fromHistory === true);
+    if (event.type === "turn_observation_incomplete") return false;
     const isForegroundEvent = agent.activeForegroundTurnId === eventTurnId;
     this.traceHandleStreamEventStart(agent, event, eventTurnId, isForegroundEvent);
     if (

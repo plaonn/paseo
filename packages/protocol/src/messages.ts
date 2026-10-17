@@ -1850,6 +1850,8 @@ export const AgentTurnObserveRequestMessageSchema = z.object({
   turnId: z.string().optional(),
 });
 
+export const AGENT_TURN_CONTINUATION_PROMPT_MAX_LENGTH = 262_144;
+
 export const AgentTurnContinueAfterFailureRequestMessageSchema = z.object({
   type: z.literal("agent.turn.continue_after_failure.request"),
   requestId: z.string(),
@@ -1857,7 +1859,7 @@ export const AgentTurnContinueAfterFailureRequestMessageSchema = z.object({
   expectedTurnId: z.string().min(1),
   expectedConfigDigest: z.string().regex(/^[a-f0-9]{64}$/),
   idempotencyKey: z.string().min(1).max(200),
-  prompt: z.string(),
+  prompt: z.string().min(1).max(AGENT_TURN_CONTINUATION_PROMPT_MAX_LENGTH).regex(/\S/),
 });
 
 export const AgentTimelineSearchRequestMessageSchema = z.object({
@@ -4670,6 +4672,7 @@ export const AgentTurnObservationPayloadSchema = z.object({
   model: z.string().nullable(),
   thinkingEffort: z.string().nullable(),
   mode: z.string().nullable(),
+  cwd: z.string().nullable().optional(),
   configDigest: z.string().nullable(),
   configComplete: z.boolean(),
   startedAt: z.string().nullable(),
@@ -4678,6 +4681,7 @@ export const AgentTurnObservationPayloadSchema = z.object({
     .object({
       providerCode: z.union([z.string(), z.number()]).nullable(),
       providerClass: z.string().nullable(),
+      providerRawValue: z.unknown().nullable().optional(),
       rawMessage: z.string(),
       normalizedClass: z.enum(["capacity_overload", "unknown"]),
     })
@@ -4698,8 +4702,11 @@ export const AgentTurnContinuationReceiptPayloadSchema = z.object({
   state: z.enum(["pending", "outcome_unknown", "started"]),
 });
 
-export const AgentTurnContinuationRefusalReasonSchema = z.enum([
+export const AgentTurnContinuationRefusalReasonSchema = z.string();
+
+export const AgentTurnContinuationKnownRefusalReasons = [
   "invalid_idempotency_key",
+  "invalid_prompt",
   "idempotency_key_conflict",
   "observation_unavailable",
   "agent_not_found",
@@ -4708,6 +4715,7 @@ export const AgentTurnContinuationRefusalReasonSchema = z.enum([
   "agent_not_loaded",
   "agent_state_unreadable",
   "continuation_in_progress",
+  "continuation_already_attempted",
   "queued_prompt",
   "config_mutation_in_progress",
   "active_turn",
@@ -4720,7 +4728,7 @@ export const AgentTurnContinuationRefusalReasonSchema = z.enum([
   "config_incomplete",
   "config_changed",
   "continuation_unavailable",
-]);
+] as const;
 
 export const AgentTurnObserveResponseMessageSchema = z.object({
   type: z.literal("agent.turn.observe.response"),

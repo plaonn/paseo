@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import {
+  AGENT_TURN_CONTINUATION_PROMPT_MAX_LENGTH,
   FileExplorerRequestSchema,
   PaseoWorktreeArchiveRequestSchema,
   parseServerInfoStatusPayload,
@@ -51,6 +52,47 @@ describe("project icon message security", () => {
     });
 
     expect(parsed.success).toBe(false);
+  });
+});
+
+describe("agent turn continuation protocol", () => {
+  const request = {
+    type: "agent.turn.continue_after_failure.request",
+    requestId: "continue-1",
+    agentId: "agent-1",
+    expectedTurnId: "turn-1",
+    expectedConfigDigest: "a".repeat(64),
+    idempotencyKey: "controller-attempt-1",
+    prompt: "continue with the original task",
+  };
+
+  test("requires a non-whitespace prompt within the documented size limit", () => {
+    expect(SessionInboundMessageSchema.parse(request)).toMatchObject({
+      type: "agent.turn.continue_after_failure.request",
+    });
+    for (const prompt of ["", " \n\t", "x".repeat(AGENT_TURN_CONTINUATION_PROMPT_MAX_LENGTH + 1)]) {
+      expect(SessionInboundMessageSchema.safeParse({ ...request, prompt }).success).toBe(false);
+    }
+  });
+
+  test("accepts new refusal reasons as refusals", () => {
+    expect(
+      SessionOutboundMessageSchema.parse({
+        type: "agent.turn.continue_after_failure.response",
+        payload: {
+          requestId: "continue-1",
+          agentId: "agent-1",
+          status: "refused",
+          refusalReason: "future_safety_precondition",
+          receipt: null,
+        },
+      }),
+    ).toMatchObject({
+      payload: {
+        status: "refused",
+        refusalReason: "future_safety_precondition",
+      },
+    });
   });
 });
 

@@ -5,6 +5,7 @@ import type {
   AgentSnapshotPayload,
   AgentTurnContinuationReceiptPayload,
 } from "@getpaseo/protocol/messages";
+import { AGENT_TURN_CONTINUATION_PROMPT_MAX_LENGTH } from "@getpaseo/protocol/messages";
 import { connectToDaemon, resolveAgentId } from "../../utils/client.js";
 import type {
   CommandError,
@@ -74,17 +75,28 @@ async function readContinuationPrompt(options: AgentContinueAfterFailureOptions)
       message: "Provide exactly one of --prompt or --prompt-file",
     } satisfies CommandError;
   }
-  if (hasInline) return options.prompt as string;
-  try {
-    return await readFile(resolve(options.promptFile as string), "utf8");
-  } catch (error) {
-    if (error && typeof error === "object" && "code" in error) throw error;
+  let prompt: string;
+  if (hasInline) {
+    prompt = options.prompt as string;
+  } else {
+    try {
+      prompt = await readFile(resolve(options.promptFile as string), "utf8");
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error) throw error;
+      throw {
+        code: "PROMPT_FILE_READ_ERROR",
+        message: `Failed to read prompt file: ${options.promptFile}`,
+        details: error instanceof Error ? error.message : String(error),
+      } satisfies CommandError;
+    }
+  }
+  if (!prompt.trim() || prompt.length > AGENT_TURN_CONTINUATION_PROMPT_MAX_LENGTH) {
     throw {
-      code: "PROMPT_FILE_READ_ERROR",
-      message: `Failed to read prompt file: ${options.promptFile}`,
-      details: error instanceof Error ? error.message : String(error),
+      code: "INVALID_PROMPT",
+      message: `Prompt must contain non-whitespace text and be at most ${AGENT_TURN_CONTINUATION_PROMPT_MAX_LENGTH} characters`,
     } satisfies CommandError;
   }
+  return prompt;
 }
 
 export async function runContinueAfterFailureCommand(

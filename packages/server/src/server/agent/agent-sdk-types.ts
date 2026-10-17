@@ -440,9 +440,11 @@ export type AgentStreamEvent =
       code?: string;
       providerCode?: string | number;
       providerClass?: string;
+      providerRawValue?: unknown;
       diagnostic?: string;
       turnId?: string;
     }
+  | { type: "turn_observation_incomplete"; provider: AgentProvider; turnId?: string }
   | { type: "turn_canceled"; provider: AgentProvider; reason: string; turnId?: string }
   | {
       type: "timeline";

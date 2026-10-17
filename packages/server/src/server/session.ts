@@ -7658,6 +7658,7 @@ export class Session {
             model: stored.model,
             thinkingEffort: stored.thinkingEffort,
             mode: stored.mode,
+            cwd: stored.cwd ?? null,
             configDigest: stored.configDigest,
             configComplete: stored.configComplete,
             startedAt: stored.startedAt,

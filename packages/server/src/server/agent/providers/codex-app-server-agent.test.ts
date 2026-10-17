@@ -126,6 +126,7 @@ interface CodexClientLike {
 type CodexTestSession = AgentSession & {
   connectionState: "disconnected" | "history-ready" | "connected";
   currentThreadId: string | null;
+  currentTurnId: string | null;
   activeForegroundTurnId: string | null;
   client: CodexClientLike | null;
 };
@@ -691,20 +692,23 @@ process.stdin.on("data", (chunk) => {
 }
 
 describe("Codex app-server provider", () => {
-  test("preserves typed overload codes and classes from failed turns", () => {
+  // Shape follows the bundled v2 ThreadTurnsListResponse.json TurnError definition.
+  test("preserves the schema-typed serverOverloaded signal from failed turns", () => {
     const session = createSession();
     const events: AgentStreamEvent[] = [];
     session.subscribe((event) => events.push(event));
+    const turnError = {
+      message: "Selected model is at capacity. Please try a different model.",
+      additionalDetails: null,
+      codexErrorInfo: "serverOverloaded",
+      misalignment: null,
+    };
 
     asInternals(session).handleNotification("turn/completed", {
       threadId: "test-thread",
       turn: {
         status: "failed",
-        error: {
-          message: "Selected model is at capacity. Please try a different model.",
-          code: "server_overloaded",
-          type: "server_overloaded",
-        },
+        error: turnError,
       },
     });
 
@@ -712,9 +716,100 @@ describe("Codex app-server provider", () => {
       type: "turn_failed",
       provider: "codex",
       error: "Selected model is at capacity. Please try a different model.",
-      providerCode: "server_overloaded",
-      providerClass: "server_overloaded",
+      providerClass: "serverOverloaded",
+      providerRawValue: turnError,
     });
+  });
+
+  test("preserves an unknown schema-shaped Codex error variant without normalizing it", () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const codexErrorInfo = { httpConnectionFailed: { httpStatusCode: 503 } };
+    const turnError = {
+      message: "Connection failed",
+      codexErrorInfo,
+    };
+
+    asInternals(session).handleNotification("turn/completed", {
+      threadId: "test-thread",
+      turn: { status: "failed", error: turnError },
+    });
+
+    const failed = events.at(-1);
+    expect(failed).toMatchObject({
+      type: "turn_failed",
+      providerRawValue: turnError,
+    });
+    expect(failed).not.toHaveProperty("providerClass");
+  });
+
+  test("fails closed for unmapped raw ThreadItems and allows only schema-known no-effect types", () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const access = asInternals(session);
+    access.currentTurnId = "native-turn-1";
+
+    // Fields are taken from generated v2 ThreadItem variants. The mcpToolCall fixture
+    // deliberately omits required `id`, so the local mapper must reject it.
+    const noEffectItems = [
+      { id: "user-1", type: "userMessage", content: [] },
+      { id: "reason-1", type: "reasoning" },
+      { id: "plan-1", type: "plan", text: "inspect" },
+      { id: "compact-1", type: "contextCompaction" },
+      { id: "message-1", type: "agentMessage", text: "ready" },
+    ];
+    for (const item of noEffectItems) {
+      access.handleNotification("item/completed", {
+        threadId: "test-thread",
+        turnId: "native-turn-1",
+        item,
+      });
+    }
+    expect(events.some((event) => event.type === "turn_observation_incomplete")).toBe(false);
+
+    const unmappedItems = [
+      {
+        id: "dynamic-1",
+        type: "dynamicToolCall",
+        arguments: { path: "out.txt" },
+        status: "completed",
+        tool: "write_dynamic",
+      },
+      { id: "sleep-1", type: "sleep", durationMs: 1 },
+      {
+        type: "mcpToolCall",
+        arguments: {},
+        status: "completed",
+        server: "sample-server",
+        tool: "lookup",
+      },
+      { id: "future-1", type: "futureToolCall", payload: {} },
+    ];
+    for (const item of unmappedItems) {
+      access.handleNotification("item/completed", {
+        threadId: "test-thread",
+        turnId: "native-turn-1",
+        item,
+      });
+    }
+    expect(events.filter((event) => event.type === "turn_observation_incomplete")).toHaveLength(
+      unmappedItems.length,
+    );
+    access.handleNotification("codex/event/item_completed", {
+      threadId: "test-thread",
+      turnId: "native-turn-1",
+      msg: {
+        threadId: "test-thread",
+        turnId: "native-turn-1",
+        type: "item_completed",
+        item: { id: "mirrored-future-1", type: "futureToolCall", payload: {} },
+      },
+    });
+    expect(events.filter((event) => event.type === "turn_observation_incomplete")).toHaveLength(
+      unmappedItems.length + 1,
+    );
   });
 
   test("getAvailableModes includes auto-review when the Codex version supports it", async () => {
